@@ -59,7 +59,8 @@ in its 16-bit game mode; Coreshell was also sending every profile default over t
 - A console switch never waits forever (3 s).
 - Coreshell's kernel check, corehost's display check, the upstream watches, update-guard last.
 - MiSTer's own updaters from the Scripts folder (Update All, the downloader) run as stock, nothing in them held back;
-  a restore point of the system files (Main, the menu core, Linux) is saved first (Coreshell's `bin/run-script`,
-  through update-guard), the fallback if an update gets past the watches.
+  a restore point of the system files (Main, the menu core, Linux) is saved first (Coreshell's `bin/run-script` and
+  `bin/restore-points`, ported from update-guard, which takes over where it's installed), the fallback if an update
+  gets past the watches.
 
 Each of these keeps the stock behaviour and only removes a way for it to fail.
