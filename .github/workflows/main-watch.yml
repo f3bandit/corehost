@@ -1,0 +1,84 @@
+# Main watch: once a day, whether MiSTer's Main (MiSTer-devel/Main_MiSTer) has moved past the commit corehost is built
+# on (UPSTREAM). If it has: a trial build of the new Main with the Super MemCard / Coreshell shim and corehost.patch
+# (build.sh, ARM), and one issue here (label main-watch) with the result, the conflicting files if any, and the new
+# commits marked where they touch corehost's files or the display. A kernel change that comes with a matching Main shows
+# up here and in kernel-watch. Closed once UPSTREAM catches up. It never changes or pushes anything.
+# (Phosphor's own Main has the same watch in test_bench, upstream-watch.yml.)
+name: Main watch
+on:
+  schedule:
+    - cron: "47 12 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+concurrency:
+  group: main-watch
+  cancel-in-progress: false
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHIM: super-memcard/main/patch/main-mister-super-memcard.patch
+    steps:
+      - uses: actions/checkout@v4
+      - name: Has Main moved?
+        id: head
+        run: |
+          head=$(git ls-remote https://github.com/MiSTer-devel/Main_MiSTer refs/heads/master | cut -f1)
+          base=$(cat UPSTREAM)
+          echo "Main: $head, corehost on: $base"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          [ "$head" = "$base" ] && echo "moved=no" >> "$GITHUB_OUTPUT" || echo "moved=yes" >> "$GITHUB_OUTPUT"
+      - name: Caught up
+        if: steps.head.outputs.moved == 'no'
+        run: |
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" -l main-watch -s open --json number --jq '.[0].number // empty')
+          [ -z "$n" ] || gh issue close "$n" -R "$GITHUB_REPOSITORY" -c "UPSTREAM is at Main's head: corehost has caught up. Closing."
+      - name: The shim (super-memcard, public)
+        if: steps.head.outputs.moved == 'yes'
+        uses: actions/checkout@v4
+        with:
+          repository: f3bandit/super-memcard
+          path: super-memcard
+          sparse-checkout: main/patch
+      - name: ARM toolchain (GNU 10.2-2020.11, as Main_MiSTer)
+        if: steps.head.outputs.moved == 'yes'
+        uses: actions/cache@v4
+        id: tc
+        with:
+          path: /opt/gcc-arm
+          key: gcc-arm-10.2-2020.11
+      - if: steps.head.outputs.moved == 'yes' && steps.tc.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt/gcc-arm && sudo chown $USER /opt/gcc-arm
+          curl -fsSL https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf.tar.xz \
+            | tar xJ -C /opt/gcc-arm --strip-components=1
+      - name: Trial build and the issue
+        if: steps.head.outputs.moved == 'yes'
+        run: |
+          set -u
+          export PATH=/opt/gcc-arm/bin:$PATH
+          head=${{ steps.head.outputs.head }}; base=${{ steps.head.outputs.base }}
+          ./build.sh --shim "$SHIM" --upstream "$head" > build.log 2>&1 && rc=0 || rc=$?   # (the step runs with -e: keep going to report it)
+          echo "build.sh exit $rc"; tail -5 build.log
+          python3 -I tools/main_watch.py --src .cache/Main_MiSTer --base "$base" --head "$head" --build-exit $rc \
+            --build-log build.log --shim "$SHIM" --report report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          n=$(git -C .cache/Main_MiSTer rev-list --count --no-merges "$base..$head")
+          case $rc in 0) r="builds";; 3) r="conflicts";; 4) r="patch doesn't apply";; *) r="build failed";; esac
+          title="Main: $n new commits (up to ${head:0:7}), corehost $r"
+          gh label create main-watch -R "$GITHUB_REPOSITORY" -c BFD4F2 -d "MiSTer's Main moved past UPSTREAM" 2>/dev/null || true
+          { cat report.md; echo; echo "From [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Nothing was changed or pushed."; } > body.md
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" -l main-watch -s open --json number,title --jq '.[0] | select(.) | "\(.number)|\(.title)"')
+          if [ -z "$existing" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" -l main-watch --title "$title" --body-file body.md
+          elif [ "${existing#*|}" != "$title" ]; then
+            gh issue edit "${existing%%|*}" -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+            gh issue comment "${existing%%|*}" -R "$GITHUB_REPOSITORY" --body "Updated: $n new commits, up to ${head:0:7}; corehost $r."
+          else
+            echo "already reported"
+          fi

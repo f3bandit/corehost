@@ -1,0 +1,64 @@
+# Kernel watch: once a day, what MiSTer's Linux kernel (MiSTer-devel/Linux-Kernel_MiSTer) changed since the commit in
+# KERNEL, the one corehost and Coreshell were last checked against. tools/kernel_watch.py sorts it by what it can break
+# for a frontend: the framebuffer driver (where the screen is, its shape and parameters), the kernel options frontends
+# rely on, a move to a new kernel line, then input, USB, Bluetooth/Wi-Fi and the rest.
+# A new kernel only reaches a MiSTer inside a new MiSTer Linux, so this is the early warning: the change is known,
+# and a fix is ready, before Update All can install it. One issue here (label kernel-watch), updated as more lands;
+# closed once KERNEL is moved forward. It never changes or pushes anything.
+name: Kernel watch
+on:
+  schedule:
+    - cron: "23 12 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+concurrency:
+  group: kernel-watch
+  cancel-in-progress: false
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KREPO: https://github.com/MiSTer-devel/Linux-Kernel_MiSTer
+    steps:
+      - uses: actions/checkout@v4
+      - name: The kernel's history (no file contents until needed)
+        run: |
+          set -e
+          git clone -q --filter=blob:none --no-checkout "$KREPO" kernel
+          branch=$(git ls-remote --symref "$KREPO" HEAD | awk '$1 == "ref:" {sub("refs/heads/", "", $2); print $2}')
+          echo "default branch: $branch"
+          echo "BRANCH=$branch" >> "$GITHUB_ENV"
+      - name: What changed
+        run: |
+          python3 -I tools/kernel_watch.py --repo kernel --branch "$BRANCH" --report report.md --state state.json
+          cat state.json
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: The issue
+        run: |
+          set -eu
+          level=$(python3 -I -c "import json; print(json.load(open('state.json'))['level'])")
+          n=$(python3 -I -c "import json; print(json.load(open('state.json'))['commits'])")
+          head=$(python3 -I -c "import json; print(json.load(open('state.json'))['head'][:7])")
+          gh label create kernel-watch -R "$GITHUB_REPOSITORY" -c D93F0B -d "MiSTer's kernel changed since KERNEL" 2>/dev/null || true
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" -l kernel-watch -s open --json number,title --jq '.[0] | select(.) | "\(.number)|\(.title)"')
+          if [ "$level" = none ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "${existing%%|*}" -R "$GITHUB_REPOSITORY" -c "KERNEL is at the kernel's head ($head): checked. Closing."
+            fi
+            exit 0
+          fi
+          case "$level" in act) what="needs a change or a check";; look) what="worth a look";; *) what="nothing for frontends";; esac
+          title="Kernel: $what ($n new on $BRANCH, up to $head)"
+          { cat report.md; echo; echo "From [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Nothing was changed."; } > body.md
+          if [ -z "$existing" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" -l kernel-watch --title "$title" --body-file body.md
+          elif [ "${existing#*|}" != "$title" ]; then
+            gh issue edit "${existing%%|*}" -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+            gh issue comment "${existing%%|*}" -R "$GITHUB_REPOSITORY" --body "More landed: now $n commits on $BRANCH, up to $head ($what)."
+          else
+            echo "already reported"
+          fi

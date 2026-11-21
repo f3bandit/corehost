@@ -1,0 +1,2242 @@
+diff --git a/cfg.cpp b/cfg.cpp
+index deb3d50..ade9009 100644
+--- a/cfg.cpp
++++ b/cfg.cpp
+@@ -591,6 +591,31 @@ const char* cfg_get_label(uint8_t alt)
+ 	return label;
+ }
+ 
++// Coreshell's handoff (ported from Phosphor's Main): INI settings for this launch, read after the INI (never written)
++static char cfg_overrides[2048];
++
++void cfg_set_overrides(const char *lines)
++{
++	snprintf(cfg_overrides, sizeof(cfg_overrides), "%s", lines ? lines : "");
++}
++
++static void cfg_apply_overrides()
++{
++	char line[512];
++	for (const char *p = cfg_overrides; *p; )
++	{
++		const char *e = strchr(p, '\n');
++		size_t n = e ? (size_t)(e - p) : strlen(p);
++		if (n && n < sizeof(line))
++		{
++			memcpy(line, p, n);
++			line[n] = 0;
++			ini_parse_var(line);
++		}
++		p += n + (e ? 1 : 0);
++	}
++}
++
+ void cfg_parse()
+ {
+ 	memset(&cfg, 0, sizeof(cfg));
+@@ -627,6 +652,7 @@ void cfg_parse()
+ 		// second pass to look for section without vrefresh
+ 		ini_parse(altcfg(), video_get_core_mode_name(0));
+ 	}
++	cfg_apply_overrides();   // Coreshell's handoff
+ 
+ 	if (strlen(cfg.vga_mode))
+ 	{
+diff --git a/cfg.h b/cfg.h
+index 330e10c..7c30022 100644
+--- a/cfg.h
++++ b/cfg.h
+@@ -138,4 +138,6 @@ struct yc_mode
+ 
+ void yc_parse(yc_mode *yc_table, int max);
+ 
++void cfg_set_overrides(const char *lines);   // Coreshell: "key=value\n" lines read after the INI, this launch only
++
+ #endif // __CFG_H__
+diff --git a/cheats.cpp b/cheats.cpp
+index 26ed2d1..a90f877 100644
+--- a/cheats.cpp
++++ b/cheats.cpp
+@@ -463,3 +463,22 @@ int cheats_loaded()
+ {
+ 	return loaded;
+ }
++
++// For a frontend's own Cheats screen (the OSD's, without it): a cheat's name (".gg" off) and whether it's on, and
++// MiSTer's own toggle on it (cheats_toggle, the entry picked as the OSD picks it)
++int cheats_item(int i, char *name, int n, int *on)
++{
++	if (i < 0 || i >= cheats_available()) return 0;
++	snprintf(name, n, "%s", cheats[i].name);
++	int l = strlen(name);
++	if (l > 3 && !strncasecmp(name + l - 3, ".gg", 3)) name[l - 3] = 0;
++	*on = cheats[i].enabled ? 1 : 0;
++	return 1;
++}
++int cheats_toggle_at(int i)
++{
++	if (i < 0 || i >= cheats_available()) return -1;
++	iSelectedEntry = i;
++	cheats_toggle();
++	return cheats[i].enabled ? 1 : 0;
++}
+diff --git a/cheats.h b/cheats.h
+index 0404577..a10c79a 100644
+--- a/cheats.h
++++ b/cheats.h
+@@ -8,6 +8,8 @@ void cheats_scroll_name();
+ void cheats_print();
+ void cheats_toggle();
+ int cheats_loaded();
++int cheats_item(int i, char *name, int n, int *on);   // a frontend's Cheats screen
++int cheats_toggle_at(int i);
+ 
+ void cheats_init_arcade(int unit_size, int max_active);
+ void cheats_add_arcade(const char *name, const char *cheatData, int cheatSize);
+diff --git a/corehost.cpp b/corehost.cpp
+new file mode 100644
+index 0000000..4b0b53c
+--- /dev/null
++++ b/corehost.cpp
+@@ -0,0 +1,1008 @@
++// corehost: Coreshell's engine, MiSTer's Main with the frontend in charge of the screen and the controllers.
++//
++// Codenames: Coreshell is Kugutsu no Jutsu (傀儡の術, the puppet technique: every stock core on its strings), corehost is
++// Infinite Tsukuyomi (無限月読: the cores run on, believing MiSTer is there), and this, corehost's ARM side, is Fushi
++// Tensei (不死転生, Orochimaru's reincarnation: it lives on in MiSTer's own Main and moves into each new one).
++//
++// Main_MiSTer as it is upstream (every core, every system's loading code, the scaler, input, saves), plus this
++// file: a local API a frontend (Phosphor, Console Mode, any other) drives instead of MiSTer's OSD. While a
++// frontend is connected and has the screen, Main's own menu never opens; when none is (none started, or it
++// went away), Main's menu is there as always, so nobody is ever locked out.
++//
++// Ported from Phosphor's Main (phosphor-main/phosphor.cpp): the same socket protocol and command names, so a
++// frontend written for Phosphor's Main talks to corehost by changing only the socket path.
++//
++// Socket: /tmp/corehost.sock (COREHOST_SOCK overrides), one command per line, one JSON reply per line.
++//   hello                    {"ok":true,"api":1,"name":"corehost",...}
++//   status                   core, menu, osd, fb, owner, sheet, file
++//   subscribe                events to this client: core, osd, menu_button, pad, ingame, file, info
++//   screen frontend|main     the menu core's screen: the frontend's framebuffer, or Main's menu
++//                            ("screen phosphor" is the same as "screen frontend")
++//   sheet on|off             in a game, the menu button goes to the frontend ({"event":"menu_button"})
++//   ingame on|off            the frontend's framebuffer over the running game (its in-game menu)
++//   ingame osd               Main's own menu over the game, for what the frontend doesn't do yet
++//   confstr                  the running core's config string, every line, and each line's state (shown/hidden/disabled)
++//   opt O<bits>|o<bits> [v]  a status field: read it, or set it and read it
++//   action <line>            the config string's line <line> (a T/R/t/r entry) run as the OSD runs it,
++//                            each system's own handling with it (Mega CD, PSX, Saturn, N64 resets ...)
++//   reset                    the core's own Reset (its first R/r entry), or the keyboard reset held 1 s
++//   here <file.mgl>          an MGL's options, files, mounts and resets on the running core (no reload)
++//   launch <path>            an .rbf, .mra or .mgl
++//   screenshot               MiSTer's screenshot of the running game
++//   osdtext                  the OSD's rows as text (tests: what the OSD shows)
++//   frontend NAME            the frontend's name: "Return to NAME" in every core's menu (else the name it gave Coreshell)
++//   script PATH              (the frontend, owning the screen, in the menu core) run a script the way MiSTer's Scripts menu
++//                            does: /tmp/script on tty2, MiSTer's terminal, "Press any key to continue"; then event
++//                            {"event":"script_done","status":N} and the frontend has the screen again (docs/stock-behaviour.md)
++//   display                  the kernel's framebuffer checked as Main uses it: usable, or why not (a frontend is
++//                            refused the screen then, and MiSTer's OSD stays: never a black screen)
++// Each command here calls the function Main's own menu calls: nothing is written twice.
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 f3bandit. Part of corehost, a fork of Main_MiSTer (Alexey Melnikov "Sorgelig" and the MiSTer devs),
++// under Main_MiSTer's licence: GPL-3.0 or later (see LICENSE). Programs that only talk to corehost over its socket
++// (Coreshell, frontends) are separate works under their own licences (NOTICE).
++#include "corehost.h"
++#include "scaler.h"
++#include "menu.h"
++#include "user_io.h"
++#include "video.h"
++#include "fpga_io.h"
++#include "file_io.h"
++#include "input.h"
++#include "hardware.h"
++#include "support/arcade/mra_loader.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/fb.h>
++#include <sys/ioctl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <signal.h>
++
++#define CH_API 1
++#define CH_SOCK "/tmp/corehost.sock"
++#define CH_MAX 4
++#define CH_LINE 1024
++
++// the upstream Main this corehost was built on, and how many times it has moved to a new one (build.sh writes it)
++#if __has_include("corehost_version.h")
++#include "corehost_version.h"
++#endif
++#ifndef COREHOST_UPSTREAM
++#define COREHOST_UPSTREAM "unknown"
++#endif
++#ifndef COREHOST_LIVES
++#define COREHOST_LIVES 0
++#endif
++
++typedef struct {
++	int fd;
++	int subscribed;
++	size_t len;
++	char buf[CH_LINE];
++} ch_client_t;
++
++static int lfd = -1;
++static ch_client_t cl[CH_MAX];
++static int inited;
++static int owner = -1;           // the client that owns the screen and the controllers, -1: Main
++static char fe_name[40];         // the frontend's name at +1; [0]: 0 none, 1 set by `frontend`, 2 from Coreshell
++static int sheet_client = -1;    // the client that takes the menu button in a game
++static int ingame_client = -1;   // the frontend's framebuffer is over the running game for this client
++static uint32_t rep_mask;        // the held direction repeated to the frontend, 0: none
++static unsigned long rep_next;
++static char last_core[64];
++static int last_osd = -1;
++static int osd_direct;           // Main's own menu key press and release, from "ingame osd": straight through
++static unsigned long osd_release;
++static unsigned long hold_until; // the menu core waits for a frontend until then (no OSD); 0: no wait
++static char cur_file[1024];
++
++// ---- the kernel's display (self-healing with Coreshell's kernel.py): before a frontend gets the screen, the kernel's
++// framebuffer is checked to be where Main shows it (video.cpp FB_ADDR + 4096) and the shape MiSTer's driver was given.
++// The frontend stays in charge whenever it can draw. Only if it can't (a Linux update moved the framebuffer) is the
++// screen kept on the OSD, which the FPGA draws without Linux: never a black screen. Coreshell's kernel verdict is passed
++// on in the "display" command and event (a frontend can warn the user), never used to take the screen.
++#define CH_FB_ADDR (0x20000000 + (32 * 1024 * 1024) + 4096)   // (video.cpp FB_ADDR + 4096: the first page is the driver's)
++static int disp_ok = -1;                 // -1 not checked yet, 1 fine, 0 not usable
++static char disp_why[200];
++static char disp_info[200];
++static char disp_cs[16];                // Coreshell's kernel state, as it wrote it ("" if none)
++
++static long sys_num(const char *path)
++{
++	char b[32] = {};
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0) return -1;
++	int n = (int)read(fd, b, sizeof(b) - 1);
++	close(fd);
++	return n > 0 ? strtol(b, NULL, 10) : -1;
++}
++
++static int display_check(void)
++{
++	disp_why[0] = 0;
++	struct fb_var_screeninfo v;
++	struct fb_fix_screeninfo f;
++	int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
++	if (fd < 0) { snprintf(disp_why, sizeof(disp_why), "no framebuffer (/dev/fb0)"); return disp_ok = 0; }
++	int q = ioctl(fd, FBIOGET_VSCREENINFO, &v) || ioctl(fd, FBIOGET_FSCREENINFO, &f);
++	close(fd);
++	if (q) { snprintf(disp_why, sizeof(disp_why), "the framebuffer doesn't answer FBIOGET_*SCREENINFO"); return disp_ok = 0; }
++	snprintf(disp_info, sizeof(disp_info), "%ux%u, %u bits, %u bytes a row, at 0x%08lx", v.xres, v.yres, v.bits_per_pixel,
++	         f.line_length, (unsigned long)f.smem_start);
++	if (f.smem_start != CH_FB_ADDR)
++		snprintf(disp_why, sizeof(disp_why), "the framebuffer is at 0x%08lx, Main shows 0x%08x", (unsigned long)f.smem_start, CH_FB_ADDR);
++	else if (v.bits_per_pixel != 32)
++		snprintf(disp_why, sizeof(disp_why), "the framebuffer is %u bits a pixel, Main gives it 32", v.bits_per_pixel);
++	else if (f.line_length < v.xres * 4)
++		snprintf(disp_why, sizeof(disp_why), "the framebuffer's rows (%u bytes) are shorter than its width", f.line_length);
++	else {
++		long w = sys_num("/sys/module/MiSTer_fb/parameters/width"), h = sys_num("/sys/module/MiSTer_fb/parameters/height");
++		if (w > 0 && h > 0 && (w != (long)v.xres || h != (long)v.yres))
++			snprintf(disp_why, sizeof(disp_why), "MiSTer's driver was given %ldx%ld, the framebuffer says %ux%u", w, h, v.xres, v.yres);
++	}
++	// Coreshell's own verdict (kernel.py: ok, adapted, degraded) is passed on, never a reason to take the screen: it also
++	// covers uinput, /dev/mem and the reserved memory, and the frontend stays in charge while it can draw.
++	disp_cs[0] = 0;
++	int sf = open("/media/fat/coreshell/state/kernel/state", O_RDONLY | O_CLOEXEC);
++	if (sf >= 0)
++	{
++		int n = (int)read(sf, disp_cs, sizeof(disp_cs) - 1);
++		close(sf);
++		disp_cs[n > 0 ? n : 0] = 0;
++		for (char *c = disp_cs; *c; c++) if (*c < 'a' || *c > 'z') { *c = 0; break; }
++	}
++	return disp_ok = disp_why[0] ? 0 : 1;
++}
++
++static void send_line(int i, const char *s);
++
++// ---- scripts (Update All, the downloader, Scripts/*.sh), run the way MiSTer's Scripts menu runs them (ported from
++// Phosphor's Main: docs/stock-behaviour.md)
++static pid_t script_pid;
++static int script_state, script_client = -1, script_status;   // state: 0 none, 1 running, 2 "press any key"
++int video_chvt(int num);
++
++static void script_finish(void)
++{
++	script_state = 0;
++	video_chvt(1);
++	video_fb_console_done();
++	if (script_client >= 0 && cl[script_client].fd >= 0)
++	{
++		char ev[80];
++		snprintf(ev, sizeof(ev), "{\"event\":\"script_done\",\"status\":%d}", script_status);
++		send_line(script_client, ev);
++	}
++	script_client = -1;
++}
++
++static void script_start(int i, const char *path)
++{
++	struct stat sb;
++	if (owner != i || !is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"take the screen first (screen phosphor)\"}"); return; }
++	if (script_state) { send_line(i, "{\"ok\":false,\"error\":\"a script is running\"}"); return; }
++	if (strncmp(path, "/media/", 7) || strstr(path, "..") || strchr(path, '"') || strchr(path, '$') || strchr(path, '`')
++		|| stat(path, &sb) || !S_ISREG(sb.st_mode))
++	{
++		send_line(i, "{\"ok\":false,\"error\":\"no such script\"}");
++		return;
++	}
++	static char cmd[2048];
++	// through Coreshell's runner when it's installed (compat/ on the PATH; an add-on in its addons/ registry named after
++	// the frontend in its own menu): the script itself, from its folder, either way (docs/stock-behaviour.md)
++	const char *runner = access("/media/fat/coreshell/bin/run-script", X_OK) ? "" : "/media/fat/coreshell/bin/run-script ";
++	snprintf(cmd, sizeof(cmd), "#!/bin/bash\nexport LC_ALL=en_US.UTF-8\nexport HOME=/root\ncd \"$(dirname \"%s\")\"\n%s\"%s\"\n"
++		"EXITSTATUS=$?\necho \"Press any key to continue\"\nexit $EXITSTATUS\n", path, runner, path);
++	// /tmp/script, as MiSTer's Scripts menu names it: Update All (its Patreon/device check) and other scripts look for
++	// it among their parents to know they run in MiSTer's terminal, and come back the way they do on stock MiSTer
++	unlink("/tmp/script");
++	int fd = open("/tmp/script", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
++	if (fd < 0 || write(fd, cmd, strlen(cmd)) != (ssize_t)strlen(cmd)) { if (fd >= 0) close(fd); send_line(i, "{\"ok\":false,\"error\":\"can't write /tmp\"}"); return; }
++	close(fd);
++	video_fb_console();
++	video_chvt(2);
++	script_pid = fork();
++	if (!script_pid)
++	{
++		// a session of its own, so tty2 becomes the script's controlling terminal (this agetty doesn't do it:
++		// "cannot get controlling tty", and Ctrl+C, job control and the idle check saw no owner). Stock's
++		// Scripts menu skips this; its Help page (MENU_DOC) does it
++		setsid();
++		execl("/sbin/agetty", "/sbin/agetty", "-a", "root", "-l", "/tmp/script", "--nohostname", "-L", "tty2", "linux", NULL);
++		_exit(127);
++	}
++	if (script_pid < 0) { video_chvt(1); video_fb_console_done(); send_line(i, "{\"ok\":false,\"error\":\"can't start it\"}"); return; }
++	script_state = 1;
++	script_client = i;
++	script_status = 0;
++	send_line(i, "{\"ok\":true}");
++}
++
++static void script_poll(void)
++{
++	int st;
++	if (script_state == 1 && waitpid(script_pid, &st, WNOHANG) > 0)
++	{
++		script_status = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++		script_state = 2;                      // "Press any key to continue" is on the screen
++	}
++}
++
++static void display_refused(int i)
++{
++	char out[400];
++	snprintf(out, sizeof(out), "{\"ok\":false,\"error\":\"the frontend can't draw on this kernel's framebuffer, so the screen stays on the OSD: %s\"}", disp_why);
++	send_line(i, out);
++	printf("corehost: display: %s\n", disp_why);
++}
++
++static const char *sock_path(void)
++{
++	const char *p = getenv("COREHOST_SOCK");
++	return p && *p ? p : CH_SOCK;
++}
++
++static void ch_init(void)
++{
++	inited = 1;
++	// on the menu core, Main's menu waits a moment for a frontend to connect (COREHOST_HOLD_MS, 10 s by default):
++	// none in that time, and Main's menu is shown as always
++	const char *h = getenv("COREHOST_HOLD_MS");
++	long ms = h && *h ? strtol(h, NULL, 10) : 10000;
++	if (ms > 0) hold_until = GetTimer(ms);
++	for (int i = 0; i < CH_MAX; i++) cl[i].fd = -1;
++	unlink(sock_path());
++	lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++	if (lfd < 0) return;
++	struct sockaddr_un a = {};
++	a.sun_family = AF_UNIX;
++	snprintf(a.sun_path, sizeof(a.sun_path), "%s", sock_path());
++	mode_t old = umask(077);       // root only
++	int ok = bind(lfd, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(lfd, 4) == 0;
++	umask(old);
++	if (!ok) { printf("corehost: can't listen on %s\n", sock_path()); close(lfd); lfd = -1; return; }
++	printf("corehost: API on %s (upstream Main %s)\n", sock_path(), COREHOST_UPSTREAM);
++}
++
++static void drop(int i);
++static void send_line(int i, const char *s)
++{
++	if (cl[i].fd < 0) return;
++	size_t n = strlen(s);
++	// small replies on a local socket: if it can't take a whole line now, the client isn't reading
++	if (send(cl[i].fd, s, n, MSG_NOSIGNAL | MSG_DONTWAIT) != (ssize_t)n || send(cl[i].fd, "\n", 1, MSG_NOSIGNAL | MSG_DONTWAIT) != 1)
++	{
++		printf("corehost: client %d not reading, dropped\n", i);
++		drop(i);
++	}
++}
++
++static void json_str(char *out, size_t n, const char *s)   // s as a JSON string body (no quotes)
++{
++	size_t j = 0;
++	for (; s && *s && j + 7 < n; s++)
++	{
++		unsigned char c = (unsigned char)*s;
++		if (c == '"' || c == '\\') { out[j++] = '\\'; out[j++] = (char)c; }
++		else if (c < 0x20) j += snprintf(out + j, n - j, "\\u%04x", c);
++		else out[j++] = (char)c;
++	}
++	out[j] = 0;
++}
++
++static void event_all(const char *s)
++{
++	for (int i = 0; i < CH_MAX; i++) if (cl[i].fd >= 0 && cl[i].subscribed) send_line(i, s);
++}
++
++static void give_back(void)
++{
++	if (owner < 0) return;
++	owner = -1;
++	if (is_menu()) menu_corehost_screen(0);
++	printf("corehost: screen back to Main\n");
++}
++
++static void ingame_end(int i)
++{
++	if (ingame_client != i) return;
++	ingame_client = -1;
++	rep_mask = 0;
++	if (!is_menu() && video_fb_state()) video_fb_enable(0);
++}
++
++static void drop(int i)
++{
++	close(cl[i].fd);
++	cl[i].fd = -1;
++	if (owner == i) give_back();      // the frontend went away: Main's menu comes back
++	if (sheet_client == i) sheet_client = -1;
++	ingame_end(i);
++}
++
++static void status_line(char *out, size_t n)
++{
++	char core[128], file[2100];
++	json_str(core, sizeof(core), user_io_get_core_name());
++	json_str(file, sizeof(file), cur_file);
++	snprintf(out, n, "{\"ok\":true,\"core\":\"%s\",\"menu\":%s,\"osd\":%s,\"fb\":%s,\"owner\":\"%s\",\"sheet\":%s,\"file\":\"%s\"}",
++		core, is_menu() ? "true" : "false", user_io_osd_is_visible() ? "true" : "false",
++		video_fb_state() ? "true" : "false", owner >= 0 ? "frontend" : "main", sheet_client >= 0 ? "true" : "false", file);
++}
++
++// the config string line n with its H/D/h/d (hide, disable) and P<n> (page) prefixes skipped; NULL: no such line
++static const char *conf_entry(int n)
++{
++	char *p = user_io_get_confstr(n);
++	if (!p) return NULL;
++	while ((p[0] == 'H' || p[0] == 'D' || p[0] == 'h' || p[0] == 'd') && strlen(p) > 2) p += 2;
++	if (p[0] == 'P' && p[1] >= '0' && p[1] <= '9' && p[2] != ',') p += 2;
++	return p;
++}
++
++// the core's own Reset: the R/T entry on status bit 0 (MiSTer's reset bit in every core; the OSD runs each disc
++// system's reset with it), or failing that one labelled "Reset", through Main's own handling. 0: the core has none.
++// (Not simply the first R entry: NES's first is "R6,Load Backup RAM".)
++static int core_reset(void)
++{
++	const char *named = NULL;
++	for (int n = 1; ; n++)
++	{
++		if (!user_io_get_confstr(n)) break;
++		const char *p = conf_entry(n);
++		if (!p[0] || !strchr("RT", p[0])) continue;
++		int bit;
++		if (user_io_status_bits(p + 1, &bit, 0, 0) == 1 && bit == 0) return menu_status_action(p) >= 0;
++		const char *label = strchr(p, ',');
++		if (!named && label && !strncasecmp(label + 1, "Reset", 5) && (!label[6] || label[6] == ',')) named = p;
++	}
++	return named && menu_status_action(named) >= 0;
++}
++
++static void command(int i, char *line)
++{
++	char out[512];
++	while (*line == ' ') line++;
++	if (!strcmp(line, "hello"))
++	{
++		snprintf(out, sizeof(out), "{\"ok\":true,\"api\":%d,\"name\":\"corehost\",\"codename\":\"fushi_tensei\",\"part_of\":\"infinite_tsukuyomi\",\"upstream\":\"%s\",\"pads\":true,\"ingame\":true,\"osdapi\":true,\"display\":true,\"scripts\":true}", CH_API, COREHOST_UPSTREAM);
++		send_line(i, out);
++	}
++	else if (!strcmp(line, "status"))
++	{
++		char st[2600];
++		status_line(st, sizeof(st));
++		send_line(i, st);
++	}
++	else if (!strcmp(line, "subscribe"))
++	{
++		cl[i].subscribed = 1;
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "screen frontend") || !strcmp(line, "screen phosphor"))
++	{
++		if (owner >= 0 && owner != i) { send_line(i, "{\"ok\":false,\"error\":\"another client has the screen\"}"); return; }
++		if (!display_check()) { hold_until = 0; display_refused(i); return; }   // (the OSD: never a black screen)
++		owner = i;
++		hold_until = 0;
++		if (is_menu()) menu_corehost_screen(1);
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "screen main"))
++	{
++		hold_until = 0;
++		if (owner == i) give_back();
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "sheet on")) { sheet_client = i; send_line(i, "{\"ok\":true}"); }
++	else if (!strcmp(line, "sheet off")) { if (sheet_client == i) sheet_client = -1; send_line(i, "{\"ok\":true}"); }
++	else if (!strcmp(line, "ingame on"))
++	{
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		if (owner >= 0 && owner != i) { send_line(i, "{\"ok\":false,\"error\":\"another client has the screen\"}"); return; }
++		if (!display_check()) { display_refused(i); return; }
++		if (user_io_osd_is_visible()) menu_key_set(KEY_F12);   // MiSTer's menu closes first
++		owner = i;
++		ingame_client = i;
++		video_chvt(1);
++		video_fb_enable(1);
++		if (video_fb_state()) send_line(i, "{\"ok\":true}");
++		else
++		{
++			ingame_client = -1;
++			send_line(i, "{\"ok\":false,\"error\":\"this core can't show the frontend's screen\"}");
++		}
++	}
++	else if (!strcmp(line, "ingame off"))
++	{
++		ingame_end(i);
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "ingame osd"))
++	{
++		// from the frontend's in-game menu to Main's own: the frontend's screen off, the OSD open. A press and,
++		// a moment later, its release: Main's menu opens on the release, and only sees a key that changed
++		ingame_end(i);
++		if (!is_menu() && !user_io_osd_is_visible()) { osd_direct = 1; menu_key_set(KEY_F12); osd_release = GetTimer(60); }
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "osdtext"))   // the test bench: the OSD's rows, as text
++	{
++		extern char osd_text[32][40];
++		char t[2400];
++		int k = snprintf(t, sizeof(t), "{\"ok\":true,\"osd\":%s,\"rows\":\"", user_io_osd_is_visible() ? "true" : "false");
++		for (int r = 0; r < 16 && k < (int)sizeof(t) - 50; r++)
++			for (const char *c = osd_text[r]; ; c++)
++			{
++				if (!*c) { k += snprintf(t + k, sizeof(t) - k, "|"); break; }
++				if (*c >= 32 && *c < 127 && *c != '"' && *c != '\\') t[k++] = *c;
++			}
++		snprintf(t + k, sizeof(t) - k, "\"}");
++		send_line(i, t);
++	}
++	else if (!strncmp(line, "script ", 7)) script_start(i, line + 7);
++	else if (!strncmp(line, "frontend ", 9))   // its name, for "Return to <name>" in every core's menu
++	{
++		snprintf(fe_name + 1, sizeof(fe_name) - 1, "%s", line + 9);
++		for (char *c = fe_name + 1; *c; c++) if (*c < 32 || *c > 126) *c = ' ';
++		fe_name[0] = fe_name[1] ? 1 : 0;
++		send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "display"))
++	{
++		char why[260], info[260];
++		display_check();
++		json_str(why, sizeof(why), disp_why);
++		json_str(info, sizeof(info), disp_info);
++		snprintf(out, sizeof(out), "{\"ok\":true,\"usable\":%s,\"framebuffer\":\"%s\",\"why\":\"%s\",\"coreshell\":\"%s\"}", disp_ok ? "true" : "false", info, why, disp_cs);
++		send_line(i, out);
++	}
++	else if (!strcmp(line, "screenshot"))
++	{
++		if (is_menu()) send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}");
++		else { request_screenshot(NULL, 1); send_line(i, "{\"ok\":true}"); }
++	}
++	else if (!strcmp(line, "confstr"))
++	{
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		static char t[16384];
++		int k = snprintf(t, sizeof(t), "{\"ok\":true,\"core\":\"%s\",\"lines\":[", user_io_get_core_name());
++		for (int n = 0; k < (int)sizeof(t) - 600; n++)
++		{
++			char *p = user_io_get_confstr(n);
++			if (!p) break;
++			k += snprintf(t + k, sizeof(t) - k, "%s\"", n ? "," : "");
++			for (const char *c = p; *c && k < (int)sizeof(t) - 520; c++)
++			{
++				if (*c == '"' || *c == '\\') t[k++] = '\\';
++				t[k++] = (*c >= 32 && *c < 127) ? *c : ' ';
++			}
++			t[k++] = '"';
++		}
++		// each line as the OSD shows it: '.' shown, 'h' hidden, 'd' disabled (the core's OSD mask, menu_conf_state)
++		k += snprintf(t + k, sizeof(t) - k, "],\"state\":\"");
++		for (int n = 0; k < (int)sizeof(t) - 4 && user_io_get_confstr(n); n++) t[k++] = n ? menu_conf_state(n) : '.';
++		snprintf(t + k, sizeof(t) - k, "\"}");
++		send_line(i, t);
++	}
++	else if (!strncmp(line, "opt ", 4))
++	{
++		// opt O[5:4] [value] | opt oFH [value] (o: the bits above 31, as the config string's 'o'): get, or set and get
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		char spec[24] = {};
++		long val = -1;
++		int ex = 0;
++		const char *p = line + 4;
++		if (*p == 'O' || *p == 'o') { ex = (*p == 'o'); p++; }
++		int n = 0;
++		while (*p && *p != ' ' && n < (int)sizeof(spec) - 1) spec[n++] = *p++;
++		if (*p == ' ') val = strtol(p + 1, NULL, 10);
++		if (!user_io_status_bits(spec, 0, 0, ex)) { send_line(i, "{\"ok\":false,\"error\":\"bad bits\"}"); return; }
++		if (val >= 0) user_io_status_set(spec, (uint32_t)val, ex);
++		snprintf(out, sizeof(out), "{\"ok\":true,\"bits\":\"%c%s\",\"value\":%u}", ex ? 'o' : 'O', spec, user_io_status_get(spec, ex));
++		send_line(i, out);
++	}
++	else if (!strncmp(line, "action ", 7))
++	{
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		const char *p = conf_entry(atoi(line + 7));
++		if (!p || !p[0] || !strchr("TRtr", p[0]) || menu_status_action(p) < 0)
++			send_line(i, "{\"ok\":false,\"error\":\"not a trigger or reset line\"}");
++		else send_line(i, "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "cheats") || !strcmp(line, "dips"))
++	{
++		// a frontend's own Cheats and DIP switches screens: each one, its state ("cheats": name, on; "dips": name,
++		// choices, the one set), as MiSTer's OSD lists them
++		int cheats_available(), cheats_item(int, char *, int, int *);
++		int menu_dip_count(void), menu_dip_get(int, const char **, int *, int *);
++		const char *menu_dip_choice(int, int);
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		static char t[60000];
++		int dips = line[0] == 'd', n = dips ? menu_dip_count() : cheats_available();
++		int k = snprintf(t, sizeof(t), "{\"ok\":true,\"%s\":[", dips ? "dips" : "cheats");
++		auto put = [&](const char *v) {
++			t[k++] = '"';
++			for (const char *c = v; *c && k < (int)sizeof(t) - 300; c++)
++			{
++				if (*c == '"' || *c == '\\') t[k++] = '\\';
++				t[k++] = (*c >= 32 && *c < 127) ? *c : ' ';
++			}
++			t[k++] = '"';
++		};
++		for (int x = 0; x < n && k < (int)sizeof(t) - 2000; x++)
++		{
++			if (x) t[k++] = ',';
++			if (dips)
++			{
++				const char *name; int num, cur;
++				if (!menu_dip_get(x, &name, &num, &cur)) break;
++				k += snprintf(t + k, sizeof(t) - k, "{\"name\":");
++				put(name);
++				k += snprintf(t + k, sizeof(t) - k, ",\"cur\":%d,\"choices\":[", cur);
++				for (int m = 0; m < num; m++) { if (m) t[k++] = ','; put(menu_dip_choice(x, m)); }
++				k += snprintf(t + k, sizeof(t) - k, "]}");
++			}
++			else
++			{
++				char name[300]; int on = 0;
++				if (!cheats_item(x, name, sizeof(name), &on)) break;
++				k += snprintf(t + k, sizeof(t) - k, "{\"name\":");
++				put(name);
++				k += snprintf(t + k, sizeof(t) - k, ",\"on\":%s}", on ? "true" : "false");
++			}
++		}
++		snprintf(t + k, sizeof(t) - k, "]}");
++		send_line(i, t);
++	}
++	else if (!strncmp(line, "cheat ", 6) || !strncmp(line, "dip ", 4) || !strcmp(line, "dips apply"))
++	{
++		// cheat <n>: one cheat on or off (MiSTer's own toggle); dip <n> <choice>: a DIP switch set (sent, saved);
++		// dips apply: saved and the core reset, the OSD's "Reset & apply"
++		int cheats_toggle_at(int), menu_dip_set(int, int), menu_dip_apply(void);
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		int r;
++		if (line[1] == 'h') { r = cheats_toggle_at(atoi(line + 6)); snprintf(out, sizeof(out), r < 0 ? "{\"ok\":false,\"error\":\"no such cheat\"}" : "{\"ok\":true,\"on\":%s}", r > 0 ? "true" : "false"); }
++		else if (!strcmp(line, "dips apply")) { r = menu_dip_apply(); snprintf(out, sizeof(out), r ? "{\"ok\":false,\"error\":\"no DIP switches\"}" : "{\"ok\":true}"); }
++		else { int a = 0, b = 0; sscanf(line + 4, "%d %d", &a, &b); r = menu_dip_set(a, b); snprintf(out, sizeof(out), r ? "{\"ok\":false,\"error\":\"no such switch\"}" : "{\"ok\":true}"); }
++		send_line(i, out);
++	}
++	else if (!strcmp(line, "settings save") || !strcmp(line, "settings reset"))
++	{
++		// the core's menu's "Save settings" / "Reset settings" (its .CFG, and an arcade's DIP switches and NVRAM), as
++		// MiSTer's OSD does them: for a frontend's own core menu
++		int menu_settings_save(void), menu_settings_reset(void);
++		int r = line[9] == 's' ? menu_settings_save() : menu_settings_reset();
++		send_line(i, r ? "{\"ok\":false,\"error\":\"no game is running\"}" : "{\"ok\":true}");
++	}
++	else if (!strcmp(line, "reset"))
++	{
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		if (core_reset()) { send_line(i, "{\"ok\":true,\"by\":\"core\"}"); return; }
++		static const char *xml = "/tmp/corehost-reset.mgl";
++		FILE *f = fopen(xml, "w");
++		if (f) { fputs("<mistergamedescription><reset delay=\"0\" hold=\"1\"/></mistergamedescription>\n", f); fclose(f); }
++		int n = f ? mgl_run_here(xml) : -1;
++		send_line(i, n > 0 ? "{\"ok\":true,\"by\":\"keyboard\"}" : "{\"ok\":false,\"error\":\"couldn't reset\"}");
++	}
++	else if (!strncmp(line, "here ", 5))
++	{
++		char real[PATH_MAX];
++		struct stat st;
++		if (is_menu()) { send_line(i, "{\"ok\":false,\"error\":\"no game is running\"}"); return; }
++		if (!realpath(line + 5, real) || (strncmp(real, "/media/", 7) && strncmp(real, "/tmp/", 5)) || stat(real, &st) || !S_ISREG(st.st_mode))
++		{
++			send_line(i, "{\"ok\":false,\"error\":\"no such file under /media or /tmp\"}");
++			return;
++		}
++		int n = mgl_run_here(real);
++		if (n < 0) send_line(i, "{\"ok\":false,\"error\":\"an MGL is still running\"}");
++		else { snprintf(out, sizeof(out), "{\"ok\":true,\"items\":%d}", n); send_line(i, out); }
++	}
++	else if (!strncmp(line, "launch ", 7))
++	{
++		char real[PATH_MAX];
++		struct stat st;
++		if (!realpath(line + 7, real) || strncmp(real, "/media/", 7) || stat(real, &st) || !S_ISREG(st.st_mode))
++		{
++			send_line(i, "{\"ok\":false,\"error\":\"no such file under /media\"}");
++			return;
++		}
++		send_line(i, "{\"ok\":true}");
++		if (isXmlName(real)) xml_load(real);
++		else fpga_load_rbf(real);
++	}
++	// 不死転生: Orochimaru's reincarnation. corehost lives on in MiSTer's own Main, and moves into each new one
++	else if (!strcmp(line, "fushi_tensei"))
++	{
++		snprintf(out, sizeof(out), "{\"ok\":true,\"jutsu\":\"\xe4\xb8\x8d\xe6\xad\xbb\xe8\xbb\xa2\xe7\x94\x9f\",\"vessel\":\"Main_MiSTer\",\"upstream\":\"%s\",\"reincarnations\":%d}",
++			COREHOST_UPSTREAM, COREHOST_LIVES);
++		send_line(i, out);
++	}
++	// 無限月読: the running core dreams on, sure that MiSTer's own Main is there; the frontend holds the screen
++	else if (!strcmp(line, "infinite_tsukuyomi"))
++	{
++		char core[128];
++		json_str(core, sizeof(core), user_io_get_core_name());
++		snprintf(out, sizeof(out), "{\"ok\":true,\"jutsu\":\"\xe7\x84\xa1\xe9\x99\x90\xe6\x9c\x88\xe8\xaa\xad\",\"dreamer\":\"%s\",\"osd\":\"%s\",\"frontend\":%s}",
++			core, user_io_osd_is_visible() ? "open" : "sealed", owner >= 0 ? "true" : "false");
++		send_line(i, out);
++	}
++	else send_line(i, "{\"ok\":false,\"error\":\"unknown command\"}");
++}
++
++static void read_client(int i)
++{
++	for (;;)
++	{
++		ch_client_t *c = &cl[i];
++		ssize_t r = recv(c->fd, c->buf + c->len, sizeof(c->buf) - 1 - c->len, MSG_DONTWAIT);
++		if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) { drop(i); return; }
++		if (r < 0) return;
++		c->len += (size_t)r;
++		c->buf[c->len] = 0;
++		char *nl;
++		while (cl[i].fd >= 0 && (nl = (char *)memchr(c->buf, '\n', c->len)))
++		{
++			*nl = 0;
++			if (nl > c->buf && nl[-1] == '\r') nl[-1] = 0;
++			command(i, c->buf);
++			if (cl[i].fd < 0) return;
++			size_t used = (size_t)(nl - c->buf) + 1;
++			memmove(c->buf, nl + 1, c->len - used);
++			c->len -= used;
++		}
++		if (c->len >= sizeof(c->buf) - 1) { drop(i); return; }   // a line that never ends
++	}
++}
++
++// Controllers for the frontend, the way MiSTer's own menu gets them: Main reads them, with the controller's
++// MiSTer mapping, and the frontend gets {"event":"pad","b":"up","p":1|0|2} (2: held, repeated as MiSTer's menu
++// repeats). With the framebuffer up input.cpp passes the menu buttons as MiSTer's OSD takes them: X as JOY_BTN4,
++// Y as JOY_BTN3, Start as JOY_L2, Select as JOY_R2.
++static const char *pad_name(uint32_t m)
++{
++	switch (m)
++	{
++	case JOY_UP: return "up";
++	case JOY_DOWN: return "down";
++	case JOY_LEFT: return "left";
++	case JOY_RIGHT: return "right";
++	case JOY_BTN1: return "a";
++	case JOY_BTN2: return "b";
++	case JOY_BTN4: return "x";
++	case JOY_BTN3: return "y";
++	case JOY_L: return "l";
++	case JOY_R: return "r";
++	case JOY_L2: return "start";
++	case JOY_R2: return "select";
++	default: return NULL;
++	}
++}
++
++static void pad_send(uint32_t m, int p)
++{
++	const char *b = pad_name(m);
++	if (!b || owner < 0 || cl[owner].fd < 0) return;
++	char ev[64];
++	snprintf(ev, sizeof(ev), "{\"event\":\"pad\",\"b\":\"%s\",\"p\":%d}", b, p);
++	send_line(owner, ev);
++}
++
++int corehost_pad(uint32_t mask, int press)
++{
++	if (!press && mask == rep_mask) rep_mask = 0;
++	if (script_state == 1) return 0;           // the script has the controllers (MiSTer's terminal keys)
++	if (script_state == 2) { if (press) script_finish(); return 1; }
++	if (owner < 0 || !(is_menu() || ingame_client == owner) || !pad_name(mask)) return 0;
++	pad_send(mask, press ? 1 : 0);
++	if (press && (mask & JOY_MOVE)) { rep_mask = mask; rep_next = GetTimer(320); }
++	return 1;
++}
++
++// ---- the way back to the frontend, in every core's menu (menu.cpp: "Return to <name>" on the core's System page and
++// MiSTer's): the frontend that registered, by `frontend NAME` here or with Coreshell (its frontend.json). Ported from
++// Phosphor's Main (Launch Phosphor, phosphor_start); docs/stock-behaviour.md.
++static void fe_from_coreshell(void)
++{
++	static unsigned long next;
++	if (fe_name[0] == 1 || (next && !CheckTimer(next))) return;   // (1: set here: Coreshell's not asked)
++	next = GetTimer(5000);
++	char buf[2048];
++	int fd = open("/media/fat/coreshell/state/frontend.json", O_RDONLY | O_CLOEXEC);
++	if (fd < 0) { fe_name[0] = 0; return; }
++	int n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	buf[n > 0 ? n : 0] = 0;
++	const char *p = strstr(buf, "\"name\"");
++	fe_name[0] = 0;
++	if (!p || !(p = strchr(p + 6, ':')) || !(p = strchr(p, '"'))) return;
++	p++;
++	size_t k = 0;
++	while (*p && *p != '"' && k < sizeof(fe_name) - 2) fe_name[1 + k++] = (*p >= 32 && *p < 127) ? *p : ' ', p++;
++	fe_name[1 + k] = 0;
++	if (k) fe_name[0] = 2;      // (2: from Coreshell)
++}
++
++const char *corehost_frontend_name(void)
++{
++	fe_from_coreshell();
++	return fe_name[0] && fe_name[1] ? fe_name + 1 : NULL;
++}
++
++int corehost_return(void)
++{
++	if (!corehost_frontend_name()) return 0;
++	if (is_menu())
++	{
++		// a frontend connected: it gets the screen again ("show" for one that gave it to MiSTer's menu)
++		for (int i = 0; i < CH_MAX; i++) if (cl[i].fd >= 0 && cl[i].subscribed)
++		{
++			event_all("{\"event\":\"show\"}");
++			if (owner >= 0) menu_corehost_screen(1);
++			return 1;
++		}
++		return 0;
++	}
++	// in a game: the menu core, where the frontend takes the screen (the "core" event)
++	fpga_load_rbf("menu.rbf");
++	return 1;
++}
++
++uint32_t corehost_filter_key(uint32_t c)
++{
++	if (!c) return c;
++	uint32_t key = c & ~UPSTROKE;
++	if (osd_direct && key == KEY_F12) { if (c & UPSTROKE) osd_direct = 0; return c; }   // "ingame osd"
++	if (script_state == 2 && (c & UPSTROKE)) { script_finish(); return 0; }   // "press any key"
++	if (script_state) return 0;                // the keyboard types into the script's terminal
++	if (owner >= 0 && is_menu())
++	{
++		// the frontend has the controls: Main's menu does nothing (no OSD, no F9, no file browser)
++		if (key == KEY_F12 && (c & UPSTROKE)) event_all("{\"event\":\"menu_button\"}");
++		// but F9 over another program's console (Update All's device check presses it on tty3): MiSTer's terminal,
++		// as stock Main opens it, which that program waits for (ported from Phosphor's Main)
++		if (key == KEY_F9 && menu_foreign_console()) return c;
++		return 0;
++	}
++	// in a game: the menu button opens the frontend's in-game menu, on the release. Only a press that began with
++	// MiSTer's OSD closed: the press that closes the OSD (opened by "ingame osd") isn't one for the frontend too
++	static int f12_down;
++	if (sheet_client >= 0 && !is_menu() && key == KEY_F12)
++	{
++		if (!(c & UPSTROKE))
++		{
++			if (user_io_osd_is_visible()) { f12_down = 0; return c; }
++			f12_down = 1;
++			return 0;
++		}
++		if (!f12_down) return c;
++		f12_down = 0;
++		event_all("{\"event\":\"menu_button\"}");
++		return 0;
++	}
++	return c;
++}
++
++int corehost_hold_menu(void)
++{
++	if (!inited) ch_init();
++	if (!hold_until) return 0;
++	if (owner >= 0 || !is_menu() || CheckTimer(hold_until)) { hold_until = 0; return 0; }
++	return 1;
++}
++
++void corehost_info(const char *message)
++{
++	if (!inited || !message) return;
++	// the OSD's text uses MiSTer's own font above 0x7f (arrows, boxes, progress bars): not UTF-8, so a space each
++	char a[600], m[700], ev[800];
++	size_t n = 0;
++	for (const char *c = message; *c && n < sizeof(a) - 1; c++) a[n++] = ((unsigned char)*c < 0x80) ? *c : ' ';
++	a[n] = 0;
++	json_str(m, sizeof(m), a);
++	snprintf(ev, sizeof(ev), "{\"event\":\"info\",\"text\":\"%s\"}", m);
++	event_all(ev);
++}
++
++void corehost_file(const char *path, int index, int mount)
++{
++	if (!path || !*path) return;
++	snprintf(cur_file, sizeof(cur_file), "%s", path);
++	if (!inited) return;
++	char p[2100], ev[2200];
++	json_str(p, sizeof(p), path);
++	snprintf(ev, sizeof(ev), "{\"event\":\"file\",\"path\":\"%s\",\"index\":%d,\"mount\":%s}", p, index, mount ? "true" : "false");
++	event_all(ev);
++}
++
++// MiSTer.ini's main= for a core: 1 to stay in corehost. corehost stands in for the Main MiSTer.ini names for the menu
++// (its [MiSTer] main=, or MiSTer): that one is remembered at the first start (COREHOST_DEFAULT_MAIN, kept across
++// corehost's own restarts) and every core that uses it stays here (the RA cores go to MiSTer_RA, as MiSTer.ini says).
++// A core whose section names another fork with its own system code still gets that Main (and the frontend loses
++// corehost's API until the menu comes back: a Main that's not corehost hands the menu to MiSTer.ini's main=).
++static const char *main_base(const char *m)
++{
++	const char *b = strrchr(m, '/');
++	return b ? b + 1 : m;
++}
++
++int corehost_keep_main(const char *cfg_main)
++{
++	if (!cfg_main || !*cfg_main) return 1;
++	const char *b = main_base(cfg_main);
++	if (!strcasecmp(b, "MiSTer") || !strcasecmp(b, "corehost") || !strcasecmp(b, "MiSTer_corehost")) return 1;
++	const char *def = getenv("COREHOST_DEFAULT_MAIN");
++	if (!def || !*def)
++	{
++		if (!is_menu()) return 0;              // (started on a game: only the menu's Main is ours)
++		setenv("COREHOST_DEFAULT_MAIN", b, 1);
++		return 1;
++	}
++	return !strcasecmp(b, def);
++}
++
++void corehost_poll(void)
++{
++	script_poll();
++	if (!inited) ch_init();
++	if (osd_release && CheckTimer(osd_release)) { osd_release = 0; menu_key_set(KEY_F12 | UPSTROKE); }
++	if (rep_mask && CheckTimer(rep_next))
++	{
++		if (owner < 0) rep_mask = 0;
++		else { pad_send(rep_mask, 2); rep_next = GetTimer(85); }
++	}
++	if (lfd < 0) return;
++
++	int fd;
++	while ((fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)) >= 0)
++	{
++		int slot = -1;
++		for (int i = 0; i < CH_MAX; i++) if (cl[i].fd < 0) { slot = i; break; }
++		if (slot < 0) { close(fd); continue; }
++		cl[slot].fd = fd;
++		cl[slot].subscribed = 0;
++		cl[slot].len = 0;
++	}
++	for (int i = 0; i < CH_MAX; i++) if (cl[i].fd >= 0) read_client(i);
++
++	// Main's own menu (from "ingame osd") or Main itself took the framebuffer from the in-game menu
++	if (ingame_client >= 0 && !is_menu() && !video_fb_state())
++	{
++		if (cl[ingame_client].fd >= 0) send_line(ingame_client, "{\"event\":\"ingame\",\"on\":false}");
++		ingame_client = -1;
++		rep_mask = 0;
++	}
++
++	// the kernel's display: checked at start and every 10 s; a change is an event (a frontend can tell the user)
++	static unsigned long disp_next;
++	static int disp_last = -1;
++	static char cs_last[16];
++	if (!disp_next || CheckTimer(disp_next))
++	{
++		disp_next = GetTimer(10000);
++		display_check();
++		if (disp_ok != disp_last || strcmp(disp_cs, cs_last))
++		{
++			int lost = !disp_ok && disp_last != 0;
++			disp_last = disp_ok;
++			snprintf(cs_last, sizeof(cs_last), "%s", disp_cs);
++			char why[260], e[400];
++			json_str(why, sizeof(why), disp_why);
++			snprintf(e, sizeof(e), "{\"event\":\"display\",\"usable\":%s,\"why\":\"%s\",\"coreshell\":\"%s\"}", disp_ok ? "true" : "false", why, disp_cs);
++			event_all(e);
++			if (lost)
++			{
++				printf("corehost: display: %s: the OSD keeps the screen\n", disp_why);
++				if (owner >= 0) { send_line(owner, "{\"event\":\"ingame\",\"on\":false}"); give_back(); }
++				hold_until = 0;
++			}
++		}
++	}
++
++	char core[64], ev[256], name[128];
++	snprintf(core, sizeof(core), "%s", user_io_get_core_name());
++	if (strcmp(core, last_core))
++	{
++		snprintf(last_core, sizeof(last_core), "%s", core);
++		ingame_client = -1;
++		rep_mask = 0;
++		json_str(name, sizeof(name), core);
++		snprintf(ev, sizeof(ev), "{\"event\":\"core\",\"name\":\"%s\",\"menu\":%s}", name, is_menu() ? "true" : "false");
++		event_all(ev);
++		if (owner >= 0 && is_menu()) menu_corehost_screen(1);
++	}
++	int osd = user_io_osd_is_visible() ? 1 : 0;
++	if (osd != last_osd)
++	{
++		last_osd = osd;
++		snprintf(ev, sizeof(ev), "{\"event\":\"osd\",\"open\":%s}", osd ? "true" : "false");
++		event_all(ev);
++	}
++	// the menu core reloads its video after some actions: keep the frontend's framebuffer up
++	if (owner >= 0 && is_menu() && !video_fb_state()) menu_corehost_screen(1);
++}
++
++// ---- a game's loading box, drawn by the frontend in its own style (MiSTer's OSD progress box otherwise). Main restarts
++// with each core and is busy in the load, so nothing goes over the socket: the frontend that draws it says so in
++// /tmp/corehost/draws-loading (its pid), and the load's progress is /tmp/corehost/loading ("cur max\ttitle\tfile"),
++// written as it moves and removed at the end. Shown only for a load over 350 ms (a short one: nothing at all, as before the picture);
++// Main shows the frontend's framebuffer meanwhile and gives the picture back to the core after.
++#define CH_DRAWS_LOADING "/tmp/corehost/draws-loading"
++#define CH_LOADING "/tmp/corehost/loading"
++static int loading_drawn_by_frontend(void)
++{
++	FILE *f = fopen(CH_DRAWS_LOADING, "r");
++	if (!f) return 0;
++	int pid = 0;
++	if (fscanf(f, "%d", &pid) != 1) pid = 0;
++	fclose(f);
++	return pid > 0 && kill(pid, 0) == 0;
++}
++static int ld_keep_screen;
++int corehost_loading(const char *title, const char *text, int cur, int max)
++{
++	static int on, fb_ours, last_pct = -1;
++	static unsigned long show_at;
++	if (!cur && !max)
++	{
++		int was = on;
++		if (on) { if (fb_ours && !ld_keep_screen) video_fb_enable(0); unlink(CH_LOADING); }   // (the core's picture first, then the card goes)
++		unlink(CH_LOADING ".shown");
++		on = fb_ours = 0; show_at = 0; last_pct = -1;
++		return was || (!is_menu() && loading_drawn_by_frontend());
++	}
++	if (is_menu() || !loading_drawn_by_frontend()) return 0;
++	if (!show_at) show_at = GetTimer(350);
++	if (!CheckTimer(show_at)) return 1;              // (a short load: nothing shown)
++	if (!on)
++	{
++		on = 1;
++		fb_ours = 0;
++		unlink(CH_LOADING ".shown");
++	}
++	// the frontend's screen only once its card is drawn (it says so in loading.shown): never what was in the
++	// framebuffer before (a garbled flash on the TV, Nov 2026). Ported from Phosphor's Main (phosphor.cpp).
++	if (!fb_ours && !video_fb_state() && access(CH_LOADING ".shown", F_OK) == 0)
++	{
++		fb_ours = 1;
++		video_fb_enable(1);
++	}
++	int pct = max > 0 ? (int)((int64_t)cur * 100 / max) : 0;
++	if (pct == last_pct) return 1;
++	last_pct = pct;
++	mkdir("/tmp/corehost", 0755);
++	FILE *f = fopen(CH_LOADING ".new", "w");
++	if (f)
++	{
++		fprintf(f, "%d %d\t%s\t%s\n", cur, max, title ? title : "", text ? text : "");
++		fclose(f);
++		rename(CH_LOADING ".new", CH_LOADING);
++	}
++	return 1;
++}
++
++
++// a game's save written as it's left (the Super MemCard's leave_game), shown as the frontend's card
++// ("Saving", no progress known: max 0) instead of MiSTer's OSD box. Returns 0 when the frontend doesn't draw it
++// (a CRT's OSD text, stock): the OSD box then. Ended with on = 0: the frontend's screen stays (a core is loading
++// next), never the game's picture again for a moment.
++int corehost_saving(int on)
++{
++	if (on) return corehost_loading("Saving", "", 1, 0);
++	ld_keep_screen = 1;
++	int r = corehost_loading(NULL, NULL, 0, 0);
++	ld_keep_screen = 0;
++	return r;
++}
+diff --git a/corehost.h b/corehost.h
+new file mode 100644
+index 0000000..d710cd1
+--- /dev/null
++++ b/corehost.h
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// corehost (codename Fushi Tensei, the ARM side of Infinite Tsukuyomi): MiSTer's Main with no OSD of its own while a frontend is connected (Coreshell's engine; core_shell/corehost).
++// The frontend API is ported from Phosphor's Main (phosphor-main/phosphor.cpp): same commands, same events.
++#ifndef COREHOST_H
++#define COREHOST_H
++
++#include <stdint.h>
++
++void corehost_poll(void);                       // the main loop (scheduler.cpp)
++uint32_t corehost_filter_key(uint32_t c);       // menu.cpp: Main's menu keys, 0 when the frontend took them
++int corehost_hold_menu(void);                   // menu.cpp: 1 while the menu core waits for its frontend (no OSD)
++int corehost_pad(uint32_t mask, int press);     // input.cpp: 1 when a controller button went to the frontend
++void corehost_info(const char *message);        // menu.cpp: an OSD message, as an event too
++void corehost_file(const char *path, int index, int mount);   // user_io.cpp: a file loaded or an image mounted
++int corehost_keep_main(const char *cfg_main);   // user_io.cpp: 1 to stay in corehost when MiSTer.ini names a Main
++void menu_corehost_screen(int frontend);        // menu.cpp: the Linux framebuffer (the frontend) or Main's menu
++int menu_foreign_console(void);
++const char *corehost_frontend_name(void);         // the registered frontend's name, or NULL (menu.cpp: "Return to <name>")
++int corehost_return(void);                        // back to that frontend (menu.cpp)                  // menu.cpp: another program's console shown (a VT past 2, in use)
++int menu_status_action(const char *p);
++char menu_conf_state(int n);                    // menu.cpp: a config string line: 'h' hidden, 'd' disabled, '.' shown          // menu.cpp: a config string T/R/t/r entry, as the OSD runs it
++
++#endif
++int corehost_loading(const char *title, const char *text, int cur, int max);   // menu.cpp ProgressMessage: the frontend draws it
++int corehost_saving(int on);                     // smc_shim.cpp leave_game: the frontend's Saving card
+diff --git a/fpga_io.cpp b/fpga_io.cpp
+index 9e42672..45bbd5a 100644
+--- a/fpga_io.cpp
++++ b/fpga_io.cpp
+@@ -8,8 +8,11 @@
+ #include <termios.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <dirent.h>
++#include <fcntl.h>
+ 
+ #include "fpga_io.h"
++#include "video.h"
+ #include "file_io.h"
+ #include "input.h"
+ #include "osd.h"
+@@ -424,8 +427,59 @@ static int make_env(const char *name, const char *cfg)
+ 	return 0;
+ }
+ 
++// Before the FPGA is reprogrammed: a program still writing to the running core through /dev/mem (the lightweight
++// bridge, 0xFF200000) would hit it while it's being reloaded, and the ARM's bus to the FPGA locks up: the whole
++// system freezes, network too. Update All's device check does exactly that: its "--blank-display" writer runs in the
++// background with no check of its own while the menu core is loaded again (update_all 06ab917; an SS1 froze, Nov 16
++// 2026). Its own time limit is 2 s: a core load waits up to 3 s for it to finish (ported from Phosphor's Main).
++static int fpga_writer_running(void)
++{
++	DIR *d = opendir("/proc");
++	if (!d) return 0;
++	struct dirent *e;
++	int found = 0;
++	while (!found && (e = readdir(d)))
++	{
++		if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
++		char path[300], buf[2048];
++		snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
++		int fd = open(path, O_RDONLY | O_CLOEXEC);
++		if (fd < 0) continue;
++		int n = read(fd, buf, sizeof(buf) - 1);
++		close(fd);
++		if (n <= 0) continue;
++		int linker = 0, blank = 0;
++		for (int i = 0; i < n; i += strlen(buf + i) + 1)
++		{
++			buf[n] = 0;
++			if (!strcmp(buf + i, "--chip-id-linker")) linker = 1;
++			if (!strcmp(buf + i, "--blank-display")) blank = 1;
++		}
++		found = linker && blank;
++	}
++	closedir(d);
++	return found;
++}
++
++static void fpga_wait_for_writers(void)
++{
++	if (!fpga_writer_running()) return;
++	printf("FPGA: Update All is still writing to the core: waiting before the load\n");
++	for (int t = 0; t < 300 && fpga_writer_running(); t++) usleep(10000);
++}
++
+ int fpga_load_rbf(const char *name, const char *cfg, const char *xml)
+ {
++	fpga_wait_for_writers();   // corehost: nothing writing to the core through /dev/mem while it's reloaded
++	// the menu core by its full path (load_core /media/fat/menu.rbf: Coreshell's core dumper, add-ons) is the menu, as
++	// the bare name is (stock loads the same file either way; ported from Phosphor's Main, Nov 16 2026)
++	{
++		char mp[1024];
++		snprintf(mp, sizeof(mp), "%s/menu.rbf", getStorageDir(0));
++		if (name[0] == '/' && !strcasecmp(name, mp)) name = "menu.rbf";
++		snprintf(mp, sizeof(mp), "%s/menu.rbf", getRootDir());
++		if (name[0] == '/' && !strcasecmp(name, mp)) name = "menu.rbf";
++	}
+ 	smc_shim_leave_game();   // Super MemCard: the game's own save written first (its core saves when the OSD opens)
+ 	OsdDisable();
+ 	static char path[1024];
+@@ -617,6 +671,11 @@ char *getappname()
+ 	sprintf(path, "/proc/%d/exe", getpid());
+ 	readlink(path, dest, PATH_MAX);
+ 
++	// corehost: a binary replaced while it runs (an update) reads "<path> (deleted)": the restart for the next core
++	// then runs the new file at that path, instead of failing to start and rebooting the system
++	size_t n = strlen(dest);
++	if (n > 10 && !strcmp(dest + n - 10, " (deleted)")) dest[n - 10] = 0;
++
+ 	return dest;
+ }
+ 
+@@ -629,6 +688,7 @@ void app_restart(const char *path, const char *xml, const char *exe)
+ 	input_uinp_destroy();
+ 
+ 	offload_stop();
++	video_fb_handoff();              // the framebuffer as stock leaves it (8888), for whichever Main starts next
+ 
+ 	const char *appname = exe ? exe : getappname();
+ 	printf("restarting to %s\n", appname);
+diff --git a/input.cpp b/input.cpp
+index fee516c..0986911 100644
+--- a/input.cpp
++++ b/input.cpp
+@@ -19,6 +19,7 @@
+ #include <math.h>
+ 
+ #include "input.h"
++#include "corehost.h"   // corehost: controllers for the frontend
+ #include "autofire.h"
+ #include "user_io.h"
+ #include "menu.h"
+@@ -2195,7 +2196,13 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int
+ 			}
+ 			input_cb(&ev, 0, 0, true);
+ 		}
+-		else if (video_fb_state())
++		else if (video_fb_state() && !menu_foreign_console() && corehost_pad(mask, press))
++		{
++			// corehost: the frontend has the screen, the button went to it (mapped the way MiSTer has it)
++		}
++		// MiSTer's terminal keys: also on another program's console (Update All's dialogs on tty7 after its device
++		// check), which has the screen however the framebuffer is set, as on stock MiSTer
++		else if (video_fb_state() || menu_foreign_console())
+ 		{
+ 			switch (mask)
+ 			{
+diff --git a/main.cpp b/main.cpp
+index 0e617b2..a9e0606 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -35,6 +35,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #include "osd.h"
+ #include "offload.h"
+ #include "smc_shim.h"   // Super MemCard
++#include "corehost.h"   // corehost: the frontend API
+ 
+ const char *version = "$VER:" VDATE;
+ 
+@@ -91,6 +92,7 @@ int main(int argc, char *argv[])
+ 		input_poll(0);
+ 		HandleUI();
+ 		OsdUpdate();
++		corehost_poll();   // corehost: the frontend API
+ 	}
+ #endif
+ 	return 0;
+diff --git a/menu.cpp b/menu.cpp
+index c714d2d..323a9bc 100644
+--- a/menu.cpp
++++ b/menu.cpp
+@@ -71,6 +71,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #include "str_util.h"
+ #include "autofire.h"
+ #include "joymap_pad.h"
++#include "corehost.h"   // corehost: the frontend API
++#include <sys/ioctl.h>
++#include <linux/vt.h>
++#include <dirent.h>
+ 
+ static void progress_boxes(char *out, int boxes, int value, int max);
+ 
+@@ -291,6 +295,7 @@ enum
+ 	MENU_SYSTEM_SUB_JOYPAD_RESET,
+ 	MENU_SYSTEM_SUB_SCRIPTS,
+ 	MENU_SYSTEM_SUB_HELP,
++	MENU_SYSTEM_SUB_FRONTEND,   // corehost: "Return to <frontend>" (a frontend registered: corehost_frontend_name)
+ 	MENU_SYSTEM_SUB_REBOOT,
+ 	MENU_SYSTEM_SUB_EXIT
+ };
+@@ -1220,6 +1225,232 @@ static void joymap_system_return(int system_sub, int core_sub)
+ 	menusub = is_menu() ? system_sub : core_sub;
+ }
+ 
++// A config string T/R/t/r entry (a trigger, or a reset) as the OSD runs it, each system's own handling with it.
++// Moved here from HandleUI's generic menu by corehost, whose frontend API runs it too (corehost.cpp "action",
++// "reset"). Returns -1: not a one-bit option; 1: the menu closes (a reset); 0: it stays.
++int menu_status_action(const char *p)
++{
++	int bit;
++	int ex = (p[0] == 't') || (p[0] == 'r');
++	if (user_io_status_bits(p + 1, &bit, 0, ex) != 1) return -1;
++
++	const char *opt = p + 1;
++	if (!bit && (is_x86() || is_pcxt() || is_pcat286()))
++	{
++		x86_init();
++		ResetUART();
++		return 1;
++	}
++
++	if (!bit && is_uneon())
++	{
++		x86_ide_set();
++	}
++
++	if (is_megacd())
++	{
++		if (!bit) mcd_set_image(0, "");
++		if (bit == 1)
++		{
++			mcd_reset();
++			opt = "[0]";
++		}
++	}
++
++	if (is_pce() && !bit) pcecd_reset();
++	if (is_saturn() && !bit) saturn_reset();
++	if (is_n64() && !bit) n64_reset();
++	if (is_psx() && !bit) psx_reset();
++	if (is_atari800() && !bit) atari800_reset();
++	if (is_atari5200() && !bit) atari5200_reset();
++	if (is_3do() && !bit) p3do_reset();
++	if (is_pcfx() && !ex && bit == PCFX_BIT_NEW_CARD) pcfx_new_card();
++	if (is_videobrain() && !ex && (bit == VIDEOBRAIN_BIT_NEW_TAPE || bit == VIDEOBRAIN_BIT_NEW_PRINTER)) videobrain_new_image(bit);
++	if (is_pcfx() && !ex && bit == PCFX_BIT_EJECT_CARD) pcfx_eject_card();
++
++	user_io_status_set(opt, 1, ex);
++	if (is_n64() && !ex && !strcmp(opt, "[41]")) n64_save_dd_disk();
++	user_io_status_set(opt, 0, ex);
++
++	return (p[0] == 'R' || p[0] == 'r') ? 1 : 0;
++}
++
++// The config string line n with its H/h/D/d prefixes weighed as the OSD weighs them (the core's OSD mask): 'h' hidden,
++// 'd' disabled, '.' shown (corehost.cpp "confstr")
++char menu_conf_state(int n)
++{
++	const char *p = user_io_get_confstr(n);
++	if (!p) return 'h';
++	uint32_t hdmask = spi_uio_cmd16(UIO_GET_OSDMASK, 0);
++	int h = 0, d = 0;
++	while ((p[0] == 'H' || p[0] == 'D' || p[0] == 'h' || p[0] == 'd') && strlen(p) > 2)
++	{
++		int flg = (hdmask & (1 << user_io_hd_mask(p + 1))) ? 1 : 0;
++		if (p[0] == 'H') h |= flg;
++		if (p[0] == 'h') h |= (flg ^ 1);
++		if (p[0] == 'D') d |= flg;
++		if (p[0] == 'd') d |= (flg ^ 1);
++		p += 2;
++	}
++	return h ? 'h' : d ? 'd' : '.';
++}
++
++// Another program's console showing (a VT past 2: tty1 is MiSTer's terminal and the shell's, tty2 the Scripts menu's):
++// Update All's device check runs on tty3 and tty7 while the Linker core, which calls itself MENU, is loaded. Stock
++// Main leaves such a console alone; so does corehost (ported from Phosphor's Main): the screen goes to the shell once it's gone, or once nothing
++// has run on it for 3 s (Update All leaves tty7 showing when it is done; a program that gave up): the shell never
++// waits for nothing. (Update All's own gap on tty3, before its F9, is about 1.5 s; if this hands over in it, tty1 is what it
++// waits for anyway.)
++static int tty_in_use(int n)
++{
++	DIR *d = opendir("/proc");
++	if (!d) return 0;
++	struct dirent *e;
++	int used = 0;
++	while (!used && (e = readdir(d)))
++	{
++		if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
++		char path[300], buf[512];
++		snprintf(path, sizeof(path), "/proc/%s/stat", e->d_name);
++		int fd = open(path, O_RDONLY | O_CLOEXEC);
++		if (fd < 0) continue;
++		int len = read(fd, buf, sizeof(buf) - 1);
++		close(fd);
++		if (len <= 0) continue;
++		buf[len] = 0;
++		const char *p = strrchr(buf, ')');        // (after the name, which may hold spaces)
++		int tty_nr = 0;
++		if (p && sscanf(p + 2, "%*c %*d %*d %*d %d", &tty_nr) == 1 && tty_nr == ((4 << 8) | n)) used = 1;
++		// or a process with it open: a terminal whose agetty couldn't make it its controlling tty ("cannot get
++		// controlling tty") still has the program on it, waiting for the user (Update All's dialog on tty7 after its
++		// device check, taken back after 3 s for idle, Nov 2026)
++		if (!used)
++		{
++			char want[16], fdp[300], l[64];
++			snprintf(want, sizeof(want), "/dev/tty%d", n);
++			snprintf(path, sizeof(path), "/proc/%s/fd", e->d_name);
++			DIR *fdd = opendir(path);
++			struct dirent *f;
++			while (fdd && !used && (f = readdir(fdd)))
++			{
++				if (f->d_name[0] == '.') continue;
++				snprintf(fdp, sizeof(fdp), "%s/%s", path, f->d_name);
++				ssize_t ll = readlink(fdp, l, sizeof(l) - 1);
++				if (ll > 0) { l[ll] = 0; if (!strcmp(l, want)) used = 1; }
++			}
++			if (fdd) closedir(fdd);
++		}
++	}
++	closedir(d);
++	return used;
++}
++
++static int menu_foreign_console_now(int *last_vt_, unsigned long *idle_since_);
++static int shown_vt(void)
++{
++	int fd = open("/dev/tty0", O_RDONLY | O_CLOEXEC);
++	if (fd < 0) return 1;
++	struct vt_stat vs = {};
++	int r = ioctl(fd, VT_GETSTATE, &vs);
++	close(fd);
++	return r ? 1 : vs.v_active;
++}
++int menu_foreign_console(void)
++{
++	static int last_vt, cached;
++	static unsigned long idle_since, next;
++	if (next && !CheckTimer(next)) return cached;      // (asked every pass while it waits: a look every 250 ms)
++	next = GetTimer(250);
++	return cached = menu_foreign_console_now(&last_vt, &idle_since);
++}
++
++static int menu_foreign_console_now(int *last_vt_, unsigned long *idle_since_)
++{
++	int &last_vt = *last_vt_;
++	unsigned long &idle_since = *idle_since_;
++	int fd = open("/dev/tty0", O_RDONLY | O_CLOEXEC);
++	if (fd < 0) return 0;
++	struct vt_stat vs = {};
++	int r = ioctl(fd, VT_GETSTATE, &vs);
++	close(fd);
++	if (r || vs.v_active <= 2) { last_vt = 0; return 0; }
++	if (vs.v_active != last_vt) { last_vt = vs.v_active; idle_since = 0; }
++	if (tty_in_use(vs.v_active)) { idle_since = 0; return vs.v_active; }
++	if (!idle_since) idle_since = GetTimer(0);
++	return GetTimer(0) - idle_since < 3000 ? vs.v_active : 0;
++}
++
++// corehost: the menu core's screen for the frontend (1) or Main's menu (0), done in HandleUI where the menu state lives
++static int corehost_fb_req = -1;
++// The OSD's "Save settings" and "Reset settings" (System page), for a frontend's own menu: what MiSTer's menu does,
++// copied from its cases (generic core menu, case 14; MENU_RESET2), with nothing of its own
++int menu_settings_save(void)
++{
++	if (is_menu()) return -1;
++	if (is_archie()) { archie_save_config(); return 0; }
++	char *filename = user_io_create_config_name(1);
++	printf("Saving config to %s\n", filename);
++	user_io_status_save(filename);
++	if (is_x86() || is_pcxt() || is_pcat286()) x86_config_save();
++	if (is_arcade()) arcade_nvm_save();
++	return 0;
++}
++// An arcade core's DIP switches for a frontend's own screen (the OSD's MENU_ARCADE_DIP, without it): how many, each
++// one's name, choices and the one set; set one as the OSD does (sent to the core at once, saved); "Reset & apply"
++int menu_dip_count(void) { return is_menu() ? 0 : arcade_sw()->dip_num; }
++int menu_dip_get(int i, const char **name, int *num, int *cur)
++{
++	sw_struct *sw = arcade_sw();
++	if (is_menu() || i < 0 || i >= sw->dip_num) return 0;
++	uint64_t status = sw->dip_cur & sw->dip[i].mask;
++	int m = 0;
++	for (int n = 0; n < sw->dip[i].num; n++) if (status == sw->dip[i].val[n]) { m = n; break; }
++	*name = sw->dip[i].name; *num = sw->dip[i].num; *cur = m;
++	return 1;
++}
++const char *menu_dip_choice(int i, int m) { return arcade_sw()->dip[i].id[m]; }
++int menu_dip_set(int i, int m)
++{
++	sw_struct *sw = arcade_sw();
++	if (is_menu() || i < 0 || i >= sw->dip_num || m < 0 || m >= sw->dip[i].num) return -1;
++	sw->dip_cur = (sw->dip_cur & ~sw->dip[i].mask) | sw->dip[i].val[m];
++	arcade_sw_send();
++	arcade_sw_save();
++	return 0;
++}
++int menu_dip_apply(void)
++{
++	if (is_menu() || !arcade_sw()->dip_num) return -1;
++	arcade_sw_save();
++	user_io_status_set("[0]", 1);
++	user_io_status_set("[0]", 0);
++	return 0;
++}
++
++int menu_settings_reset(void)
++{
++	if (is_menu()) return -1;
++	if (is_minimig()) { minimig_reset(); return 0; }
++	user_io_status_reset();
++	char *filename = user_io_create_config_name(1);
++	printf("Saving config to %s\n", filename);
++	user_io_status_save(filename);
++	if (arcade_sw()->dip_num)
++	{
++		arcade_sw()->dip_cur = arcade_sw()->dip_def;
++		arcade_sw_send();
++		user_io_status_set("[0]", 1);
++		user_io_status_set("[0]", 0);
++		arcade_sw_save();
++	}
++	return 0;
++}
++
++void menu_corehost_screen(int frontend)
++{
++	corehost_fb_req = frontend;
++}
++
+ void HandleUI(void)
+ {
+ 	PROFILE_FUNCTION();
+@@ -1402,9 +1633,12 @@ void HandleUI(void)
+ 	}
+ 	else
+ 	{
+-		// get user control codes
+-		c = menu_key_get();
++		// get user control codes (corehost: none while a frontend has the controls)
++		c = corehost_filter_key(menu_key_get());
+ 	}
++	// corehost: while an MGL runs (a launch's, or the API's "here") the menu button still reaches the frontend;
++	// Main's own menu takes nothing until the MGL is done
++	if (!mgl->done) corehost_filter_key(menu_key_get());
+ 	int map_hold_action = poll_map_hold_action();
+ 	if (map_hold_action) c = 0;
+ 
+@@ -1505,6 +1739,41 @@ void HandleUI(void)
+ 		}
+ 	}
+ 
++	// corehost: give the menu core's screen to the frontend, or back to Main's menu (asked by corehost.cpp), as F9 does
++	if (corehost_fb_req >= 0)
++	{
++		int on = corehost_fb_req;
++		corehost_fb_req = -1;
++		if (on && is_menu() && menu_foreign_console())
++		{
++			// another program's console (Update All's dialogs on tty7 after its device check): Main as stock leaves
++			// it after F9, the Linux framebuffer shown, its own menu hidden, the controllers typing into that
++			// console; no switch. The frontend gets the screen when that console is gone
++			if (!video_fb_state())
++			{
++				video_fb_enable(1);
++				menustate = MENU_NONE1;     // (once, as F9 does: F12 still opens MiSTer's menu over that console)
++			}
++			has_fb_terminal = 1;
++			corehost_fb_req = on;          // (asked again each pass until that console is gone)
++		}
++		else if (on && is_menu())
++		{
++			if (!video_fb_state() || shown_vt() != 1)   // (the framebuffer on for that console: back to tty1)
++			{
++				video_chvt(1);
++				video_fb_enable(1);
++			}
++			menustate = MENU_NONE1;
++			has_fb_terminal = 1;
++		}
++		else if (!on && video_fb_state())
++		{
++			video_menu_bg(user_io_status_get("[3:1]"));
++			video_fb_enable(0);
++		}
++	}
++
+ 	//prevent OSD control while script is executing on framebuffer
+ 	if ((!video_fb_state() || video_chvt(0) != 2) && !select_ini)
+ 	{
+@@ -1782,7 +2051,7 @@ void HandleUI(void)
+ 			menustate = MENU_UNLOCK1;
+ 			osd_code_entry[0] = 0;
+ 		}
+-		else if (menu || (is_menu() && !video_fb_state()) || (menustate == MENU_NONE2 && !mgl->done && mgl->state == 1))
++		else if (menu || (is_menu() && !video_fb_state() && !corehost_hold_menu()) || (menustate == MENU_NONE2 && !mgl->done && mgl->state == 1))
+ 		{
+ 			OsdSetSize(16);
+ 			menusub = 0;
+@@ -2828,54 +3097,9 @@ void HandleUI(void)
+ 						}
+ 						else if (((p[0] == 'T') || (p[0] == 'R') || (p[0] == 't') || (p[0] == 'r')) && select)
+ 						{
+-							int bit;
+-							int ex = (p[0] == 't') || (p[0] == 'r');
+-							if (user_io_status_bits(p + 1, &bit, 0, ex) == 1)
+-							{
+-								const char *opt = p + 1;
+-								if (!bit && (is_x86() || is_pcxt() || is_pcat286()))
+-								{
+-									x86_init();
+-									ResetUART();
+-									menustate = MENU_NONE1;
+-								}
+-								else
+-								{
+-									if (!bit && is_uneon())
+-									{
+-										x86_ide_set();
+-										menustate = MENU_NONE1;
+-									}
+-
+-									if (is_megacd())
+-									{
+-										if (!bit) mcd_set_image(0, "");
+-										if (bit == 1)
+-										{
+-											mcd_reset();
+-											opt = "[0]";
+-										}
+-									}
+-
+-									if (is_pce() && !bit) pcecd_reset();
+-									if (is_saturn() && !bit) saturn_reset();
+-									if (is_n64() && !bit) n64_reset();
+-									if (is_psx() && !bit) psx_reset();
+-									if (is_atari800() && !bit) atari800_reset();
+-									if (is_atari5200() && !bit) atari5200_reset();
+-									if (is_3do() && !bit) p3do_reset();
+-									if (is_pcfx() && !ex && bit == PCFX_BIT_NEW_CARD) pcfx_new_card();
+-									if (is_videobrain() && !ex && (bit == VIDEOBRAIN_BIT_NEW_TAPE || bit == VIDEOBRAIN_BIT_NEW_PRINTER)) videobrain_new_image(bit);
+-									if (is_pcfx() && !ex && bit == PCFX_BIT_EJECT_CARD) pcfx_eject_card();
+-
+-									user_io_status_set(opt, 1, ex);
+-									if (is_n64() && !ex && !strcmp(opt, "[41]")) n64_save_dd_disk();
+-									user_io_status_set(opt, 0, ex);
+-
+-									menustate = MENU_GENERIC_MAIN1;
+-									if (p[0] == 'R' || p[0] == 'r') menustate = MENU_NONE1;
+-								}
+-							}
++							// corehost: the same code, moved to menu_status_action() so the frontend API runs it too
++							int r = menu_status_action(p);
++							if (r >= 0) menustate = r ? MENU_NONE1 : MENU_GENERIC_MAIN1;
+ 						}
+ 					}
+ 					else if (recent)
+@@ -2924,6 +3148,7 @@ void HandleUI(void)
+ 
+ 			if(!(selPath[0] && (is_atari5200() || (is_atari800() && (ioctl_index == 8 || ioctl_index == 9))))) MenuHide();
+ 			printf("File selected: %s\n", selPath);
++			corehost_file(selPath, ioctl_index, 0);   // corehost: the frontend is told
+ 			memcpy(Selected_F[ioctl_index & 15], selPath, sizeof(Selected_F[ioctl_index & 15]));
+ 
+ 			if (mgl->done && selPath[0]) recent_update(SelectedDir, Selected_F[ioctl_index & 15], SelectedLabel, ioctl_index);
+@@ -3059,6 +3284,7 @@ void HandleUI(void)
+ 			}
+ 			int image = d88_image;
+ 			d88_image = 0;
++			corehost_file(selPath, ioctl_index, 1);   // corehost: the frontend is told
+ 
+ 			if (store_name)
+ 			{
+@@ -3203,6 +3429,15 @@ void HandleUI(void)
+ 				MenuWrite(n++);
+ 				MenuWrite(n++, " Video processing          \x16", menusub==7);
+ 
++				// corehost: every core's menu has the way back to the frontend that registered, whatever the core
++				// (nothing in the core: Main draws this page), as Phosphor's Main has "Launch Phosphor" here
++				if (corehost_frontend_name())
++				{
++					menumask |= 0x100;
++					snprintf(s, 40, " Return to %.26s", corehost_frontend_name());
++					MenuWrite(n++, s, menusub == 8);
++				}
++
+ 				if (audio_filter_en() >= 0)
+ 				{
+ 					MenuWrite(n++);
+@@ -3330,6 +3565,10 @@ void HandleUI(void)
+ 				}
+ 				break;
+ 
++			case 8:                     // corehost: Return to <frontend>
++				if (corehost_return()) menustate = MENU_NONE1;
++				break;
++
+ 			case 9:
+ 				audio_set_filter_en(audio_filter_en() ? 0 : 1);
+ 				menustate = MENU_COMMON1;
+@@ -8092,7 +8331,19 @@ void HandleUI(void)
+ 		OsdWrite(m++, " Reset joypad/mouse buttons", menusub == MENU_SYSTEM_SUB_JOYPAD_RESET);
+ 		OsdWrite(m++, " Scripts                   \x16", menusub == MENU_SYSTEM_SUB_SCRIPTS);
+ 		OsdWrite(m++, " Help                      \x16", menusub == MENU_SYSTEM_SUB_HELP);
+-		OsdWrite(m++, "");
++		// corehost: back to the frontend that registered (its name), above Reboot in the row that's otherwise blank
++		// (the page has no row to spare: Exit is always the last), as Phosphor's Main has Launch Phosphor by Reboot
++		if (corehost_frontend_name())
++		{
++			char t[40];
++			snprintf(t, sizeof(t), " Return to %.26s", corehost_frontend_name());
++			OsdWrite(m++, t, menusub == MENU_SYSTEM_SUB_FRONTEND);
++		}
++		else
++		{
++			OsdWrite(m++, "");
++			menumask &= ~(1 << MENU_SYSTEM_SUB_FRONTEND);
++		}
+ 		cr = m;
+ 		OsdWrite(m++, " Reboot (hold \x16 cold reboot)", menusub == MENU_SYSTEM_SUB_REBOOT);
+ 		sysinfo_timer = 0;
+@@ -8187,6 +8438,10 @@ void HandleUI(void)
+ 				}
+ 				break;
+ 
++			case MENU_SYSTEM_SUB_FRONTEND:
++				if (corehost_return()) menustate = MENU_NONE1;
++				break;
++
+ 			case MENU_SYSTEM_SUB_EXIT:
+ 				menustate = MENU_NONE1;
+ 				break;
+@@ -9278,6 +9533,7 @@ static void set_text(const char *message, unsigned char code)
+ 
+ void InfoMessage(const char *message, int timeout, const char *title)
+ {
++	corehost_info(message);   // corehost: the frontend gets every OSD message too
+ 	if (menustate <= MENU_INFO)
+ 	{
+ 		if (menustate != MENU_INFO)
+@@ -9308,6 +9564,7 @@ int menu_present()
+ 
+ void Info(const char *message, int timeout, int width, int height, int frame)
+ {
++	corehost_info(message);   // corehost: the frontend gets every OSD message too
+ 	if (menustate <= MENU_INFO)
+ 	{
+ 		OSD_PrintInfo(message, &width, &height, frame);
+@@ -9396,6 +9653,7 @@ static void progress_boxes(char *out, int boxes, int value, int max)
+ void ProgressMessage(const char* title, const char* text, int current, int max)
+ {
+ 	static int progress;
++	if (corehost_loading(title, text, current, max)) { progress = -1; return; }   // the frontend draws it (corehost.cpp)
+ 	if (!current && !max)
+ 	{
+ 		progress = -1;
+diff --git a/osd.cpp b/osd.cpp
+index 636b614..958481f 100644
+--- a/osd.cpp
++++ b/osd.cpp
+@@ -245,8 +245,11 @@ static void draw_title(const unsigned char *p)
+ }
+ 
+ // write a null-terminated string <s> to the OSD buffer starting at line <n>
++// corehost: the OSD's rows as text, for tests (corehost.sock "osdtext"; ported from Phosphor's Main)
++char osd_text[32][40];
+ void OsdWriteOffset(unsigned char n, const char *s, unsigned char invert, unsigned char stipple, char offset, char leftchar, char usebg, int maxinv, int mininv)
+ {
++	if (n < 32) snprintf(osd_text[n], sizeof(osd_text[n]), "%c%s", invert ? '>' : ' ', s ? s : "");
+ 	//printf("OsdWriteOffset(%d)\n", n);
+ 	unsigned short i;
+ 	unsigned char b;
+diff --git a/scheduler.cpp b/scheduler.cpp
+index 5bb5c02..346b0bf 100644
+--- a/scheduler.cpp
++++ b/scheduler.cpp
+@@ -10,6 +10,7 @@
+ #include "osd.h"
+ #include "profiling.h"
+ #include "video.h"
++#include "corehost.h"   // corehost: the frontend API
+ 
+ static cothread_t co_scheduler = nullptr;
+ static cothread_t co_poll = nullptr;
+@@ -51,6 +52,7 @@ static void scheduler_co_ui(void)
+ 			SPIKE_SCOPE("co_ui", 1000);
+ 			HandleUI();
+ 			OsdUpdate();
++			corehost_poll();   // corehost: the frontend API
+ 		}
+ 
+ 		scheduler_yield();
+diff --git a/smc_shim.cpp b/smc_shim.cpp
+index 69e6f5c..1a77a1c 100644
+--- a/smc_shim.cpp
++++ b/smc_shim.cpp
+@@ -435,14 +435,24 @@ void smc_shim_leave_game()
+ 	static int busy;
+ 	if (busy || is_menu() || user_io_osd_is_visible()) return;
+ 	busy = 1;
+-	OsdSetTitle("Saving", 0);
+-	int rows = OsdGetSize();
+-	for (int i = 0; i < rows; i++) OsdWrite(i, i == rows / 2 - 1 ? "     Saving the game..." : "", 0, 0);
+-	OsdUpdate();
+-	OsdEnable(DISABLE_KEYBOARD);
++	// the frontend draws it in its own style (corehost_saving: its loading card, "Saving"); MiSTer's OSD box where
++	// no frontend does
++	int corehost_saving(int on);
++	int fe = corehost_saving(1);
++	unsigned long osd_at = fe ? 0 : GetTimer(0);
+ 	unsigned long hard = GetTimer(5000), quiet = GetTimer(500);
+ 	while (!CheckTimer(hard))
+ 	{
++		if (fe) corehost_saving(1);       // (it shows after 350 ms: a quick save shows nothing)
++		else if (osd_at)
++		{
++			osd_at = 0;
++			OsdSetTitle("Saving", 0);
++			int rows = OsdGetSize();
++			for (int i = 0; i < rows; i++) OsdWrite(i, i == rows / 2 - 1 ? "     Saving the game..." : "", 0, 0);
++			OsdUpdate();
++			OsdEnable(DISABLE_KEYBOARD);
++		}
+ 		// Main writes the save in user_io_poll(): called here from the poll loop (a command, an add-on's load_core),
+ 		// or that loop let run from the UI's (a frontend's launch), never user_io_poll() inside itself
+ 		if (!poll_thread || co_active() == poll_thread) user_io_poll();
+@@ -451,7 +461,8 @@ void smc_shim_leave_game()
+ 		else if (CheckTimer(quiet)) break;
+ 		usleep(1000);
+ 	}
+-	OsdDisable();
++	if (fe) corehost_saving(0);
++	else OsdDisable();
+ 	busy = 0;
+ }
+ 
+diff --git a/support/arcade/mra_loader.cpp b/support/arcade/mra_loader.cpp
+index cc72731..3894ac7 100644
+--- a/support/arcade/mra_loader.cpp
++++ b/support/arcade/mra_loader.cpp
+@@ -11,6 +11,7 @@
+ #include "../../file_io.h"
+ #include "../../menu.h"
+ #include "../../fpga_io.h"
++#include "../../hardware.h"   // GetTimer (mgl_run_here)
+ #include "../../lib/md5/md5.h"
+ #include "../../shmem.h"
+ #include "../../str_util.h"
+@@ -1353,6 +1354,41 @@ static int scan_mgl(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, const in
+ 
+ 	case XML_EVENT_START_NODE:
+ 		if (!strcasecmp(node->tag, "mistergamedescription")) inside_mgl = 1;
++		else if (inside_mgl && !mgl_from_mra && !strcasecmp(node->tag, "setting"))
++		{
++			// Coreshell: an INI setting for this launch (over the active INI, in memory)
++			const char *k = NULL, *v = "";
++			for (int i = 0; i < node->n_attributes; i++)
++			{
++				if (!strcasecmp(node->attributes[i].name, "key")) k = node->attributes[i].value;
++				else if (!strcasecmp(node->attributes[i].name, "value")) v = node->attributes[i].value;
++			}
++			size_t len = strlen(mgl.cs_ini);
++			if (k && *k && !strpbrk(k, "=\n") && !strchr(v, '\n') && len + strlen(k) + strlen(v) + 3 < sizeof(mgl.cs_ini))
++			{
++				snprintf(mgl.cs_ini + len, sizeof(mgl.cs_ini) - len, "%s=%s\n", k, v);
++				printf("Coreshell handoff: INI %s=%s\n", k, v);
++			}
++		}
++		else if (inside_mgl && !mgl_from_mra && !strcasecmp(node->tag, "status"))
++		{
++			// Coreshell: the core's settings for this launch: these status bits (hex, byte 0 first)
++			const char *m = NULL, *v = NULL;
++			for (int i = 0; i < node->n_attributes; i++)
++			{
++				if (!strcasecmp(node->attributes[i].name, "mask")) m = node->attributes[i].value;
++				else if (!strcasecmp(node->attributes[i].name, "value")) v = node->attributes[i].value;
++			}
++			if (m && v && strlen(m) <= 32 && strlen(v) <= 32)
++			{
++				memset(mgl.cs_mask, 0, sizeof(mgl.cs_mask));
++				memset(mgl.cs_value, 0, sizeof(mgl.cs_value));
++				for (int i = 0; m[2 * i] && m[2 * i + 1]; i++) { char b[3] = { m[2 * i], m[2 * i + 1], 0 }; mgl.cs_mask[i] = (unsigned char)strtoul(b, NULL, 16); }
++				for (int i = 0; v[2 * i] && v[2 * i + 1]; i++) { char b[3] = { v[2 * i], v[2 * i + 1], 0 }; mgl.cs_value[i] = (unsigned char)strtoul(b, NULL, 16); }
++				mgl.cs_status = 1;
++				printf("Coreshell handoff: status mask=%s value=%s\n", m, v);
++			}
++		}
+ 		else if (inside_mgl && !mgl_from_mra && !strcasecmp(node->tag, "option"))
+ 		{
+ 			if (mgl.opt_count < MGL_MAX_OPTIONS)
+@@ -1490,6 +1526,37 @@ mgl_struct* mgl_get()
+ 	return &mgl;
+ }
+ 
++// ---- Coreshell's handoff (ported from Phosphor's Main) ---------------------------------------------------------------
++
++void mgl_apply_coreshell_status(unsigned char *status, int size)
++{
++	if (!mgl.cs_status) return;
++	for (int i = 0; i < size && i < (int)sizeof(mgl.cs_mask); i++)
++		status[i] = (unsigned char)((status[i] & ~mgl.cs_mask[i]) | (mgl.cs_value[i] & mgl.cs_mask[i]));
++	printf("Coreshell handoff: the core's settings applied (its .CFG untouched)\n");
++}
++
++// corehost's frontend API ("here"): an MGL's options, file loads and resets on the core running now, its <rbf> not
++// loaded. The loads go through the same menu states a launch's MGL does (MENU_GENERIC_FILE_SELECTED / IMAGE_SELECTED,
++// each system's own handling with them), with the OSD kept hidden. Returns its items, -1: an MGL is still running.
++// Ported from Phosphor's Main.
++int mgl_run_here(const char *xml)
++{
++	if (!mgl.done) return -1;
++	mgl_parse(xml);
++	mgl_apply_options(0);
++	if (!mgl.count)
++	{
++		mgl.done = 1;
++		return 0;
++	}
++	mgl.current = 0;
++	mgl.state = 0;
++	mgl.timer = GetTimer(mgl.item[0].delay * 1000);
++	mgl.done = 0;
++	return mgl.count;
++}
++
+ // ---- MGL options ---------------------------------------------------------------------------------------------
+ 
+ static char mgl_msg[512];
+diff --git a/support/arcade/mra_loader.h b/support/arcade/mra_loader.h
+index ad5c0ff..dbc210a 100644
+--- a/support/arcade/mra_loader.h
++++ b/support/arcade/mra_loader.h
+@@ -67,6 +67,10 @@ struct mgl_struct
+ 	int  from_mra;
+ 	int  opt_count;
+ 	mgl_option_struct opt[MGL_MAX_OPTIONS];
++	char cs_ini[2048];          // Coreshell: <setting key="..." value="..."/>: "key=value\n" lines, over the active INI
++	unsigned char cs_mask[16];  // Coreshell: <status mask="hex" value="hex"/>: these status bits, over the core's .CFG
++	unsigned char cs_value[16];
++	int  cs_status;
+ };
+ 
+ sw_struct *arcade_sw();
+@@ -84,6 +88,8 @@ void arcade_nvm_save();
+ 
+ mgl_struct* mgl_parse(const char *xml);
+ mgl_struct* mgl_get();
++void mgl_apply_coreshell_status(unsigned char *status, int size);   // Coreshell's handoff
++int mgl_run_here(const char *xml);   // corehost: an MGL's options, loads and resets on the running core (no reload)
+ void mgl_apply_options(int config_found);
+ 
+ #endif
+diff --git a/user_io.cpp b/user_io.cpp
+index c601e6a..9c50ba3 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -42,6 +42,7 @@
+ #include "frame_timer.h"
+ #include "scaler.h"
+ #include "support.h"
++#include "corehost.h"   // corehost: stays the Main for MiSTer.ini's default main=
+ 
+ static char core_path[1024] = {};
+ static char rbf_path[1024] = {};
+@@ -1558,6 +1559,9 @@ void user_io_init(const char *path, const char *xml)
+ 		SelectINI();
+ 	}
+ 
++	// Coreshell: the INI settings its MGL hands this launch, over the user's INI (never written)
++	if (xml && isXmlName(xml) == 2) cfg_set_overrides(mgl_parse(xml)->cs_ini);
++	else cfg_set_overrides(NULL);
+ 	cfg_parse();
+ 	cfg_print();
+ 	while (cfg.waitmount[0] && !is_menu())
+@@ -1571,7 +1575,7 @@ void user_io_init(const char *path, const char *xml)
+ 	}
+ 
+ 	const char *main = getFullPath(cfg.main);
+-	if (strcasecmp(main, getappname()) && FileExists(main))
++	if (strcasecmp(main, getappname()) && FileExists(main) && !corehost_keep_main(cfg.main))
+ 	{
+ 		printf("Current exec is %s, core requires exec %s\n", getappname(), main);
+ 		app_restart(path, xml, main);
+@@ -1633,6 +1637,8 @@ void user_io_init(const char *path, const char *xml)
+ 					memset(cur_status, 0, sizeof(cur_status));
+ 				}
+ 
++				// Coreshell: the core's settings it hands this launch, over its .CFG (never written)
++				if (xml && isXmlName(xml) == 2) mgl_apply_coreshell_status((unsigned char *)cur_status, sizeof(cur_status));
+ 				if (xml && isXmlName(xml) == 2) mgl_apply_options(config_found);
+ 				user_io_status_set("[0]", 1);
+ 			}
+diff --git a/video.cpp b/video.cpp
+index 37dd45c..5e2f690 100644
+--- a/video.cpp
++++ b/video.cpp
+@@ -3558,10 +3558,85 @@ void video_mode_adjust(bool force)
+ 	if (refresh_info || rep_force) spd_config_update();
+ }
+ 
++// the frontend's own framebuffer mode (its fb_cmd1: a size or format of its own, e.g. 960x540 scaled up, or 16-bit),
++// kept across Main's restarts: Main starts again with each core and set the full 32-bit size back, under a frontend
++// still drawing at its own (garbage on the TV). /tmp/corehost/fb-mode holds what video_cmd set; read at start.
++// Ported from Phosphor's Main.
++#define CH_FB_MODE "/tmp/corehost/fb-mode"
++static struct { int on, fmt, rb, w, h, stride, sc_fmt; uint16_t hmin, hmax, vmin, vmax; } fe_fb;
++static void fe_fb_load(void)
++{
++	static int loaded;
++	if (loaded) return;
++	loaded = 1;
++	FILE *f = fopen(CH_FB_MODE, "r");
++	if (!f) return;
++	int v[10];
++	if (fscanf(f, "%d %d %d %d %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) == 10)
++	{
++		fe_fb.fmt = v[0]; fe_fb.rb = v[1]; fe_fb.w = v[2]; fe_fb.h = v[3]; fe_fb.stride = v[4]; fe_fb.sc_fmt = v[5];
++		fe_fb.hmin = v[6]; fe_fb.hmax = v[7]; fe_fb.vmin = v[8]; fe_fb.vmax = v[9];
++		fe_fb.on = fe_fb.w > 0 && fe_fb.h > 0 && fe_fb.stride > 0;
++	}
++	fclose(f);
++}
++
++// the frontend over a game core in 16-bit (565), when it asks (/tmp/corehost/fb-game-fmt holds "565"): half the
++// framebuffer's memory traffic, which a core that works the DDR hard (N64) otherwise contends with, and the frontend's
++// picture jitters. The menu core stays 32-bit (a frontend's FPGA background reads the alpha), and so do a script's
++// console (MiSTer's terminal is 32-bit) and a CRT terminal. Ported from Phosphor's Main.
++#define CH_FB_GAME_FMT "/tmp/corehost/fb-game-fmt"
++static int ch_console;
++static int fb_handed_off;   // (video_fb_handoff: another Main takes over)
++static int fb_game16(void)
++{
++	if (is_menu() || ch_console || con_crt || fb_handed_off) return 0;
++	FILE *f = fopen(CH_FB_GAME_FMT, "r");
++	if (!f) return 0;
++	int fmt = 0;
++	if (fscanf(f, "%d", &fmt) != 1) fmt = 0;
++	fclose(f);
++	return fmt == 565;
++}
++static int fb_game16_stride(void) { return ((con_width * 2) + 15) & ~15; }
++
++// Another Main takes over (app_restart: a core's main=, MiSTer_Quake...): the framebuffer as stock leaves it, written
++// now (after the queued writes, which may hold this Main's own mode), so that Main starts as it would on stock: never
++// a 16-bit or frontend-sized framebuffer it doesn't know about (Quake's picture, Nov 16 2026)
++void video_fb_handoff(void)
++{
++	fb_handed_off = 1;
++	fe_fb.on = 0;
++	FILE *fp = fopen("/sys/module/MiSTer_fb/parameters/mode", "wt");
++	if (fp) { fprintf(fp, "%d %d %d %d %d\n", 8888, 1, con_width, con_height, con_width * 4); fclose(fp); }
++}
++
+ static void fb_write_module_params()
+ {
+ 	int width = con_width;
+ 	int height = con_height;
++	fe_fb_load();
++	if (!fe_fb.on && fb_game16())
++	{
++		int w = width, h = height, st = fb_game16_stride();
++		offload_add_work([=]
++		{
++			FILE *fp = fopen("/sys/module/MiSTer_fb/parameters/mode", "wt");
++			if (fp) { fprintf(fp, "565 1 %d %d %d\n", w, h, st); fclose(fp); }
++		});
++		return;
++	}
++	if (fe_fb.on && !ch_console)
++	{
++		// the frontend's mode, as video_cmd wrote it
++		int fmt = fe_fb.fmt, rb = fe_fb.rb, w = fe_fb.w, h = fe_fb.h, st = fe_fb.stride;
++		offload_add_work([=]
++		{
++			FILE *fp = fopen("/sys/module/MiSTer_fb/parameters/mode", "wt");
++			if (fp) { fprintf(fp, "%d %d %d %d %d\n", fmt, rb, w, h, st); fclose(fp); }
++		});
++		return;
++	}
+ 	int font = !con_crt ? 0 : (height < 400) ? 8 : 16;
+ 
+ 	offload_add_work([=]
+@@ -3582,6 +3657,29 @@ static void fb_write_module_params()
+ 	});
+ }
+ 
++// corehost (ported from Phosphor's Main): the framebuffer as MiSTer's own terminal has it (after a frontend changed
++// its mode with fb_cmd1), for running a script the way the Scripts menu does. At 1080p the terminal is 1920 wide, so
++// the 8x16 font gives 240 columns and the updaters' 80-column output sits small at the left; a 16x32
++// font on the script's console (tty2) gives 120x33, drawn natively. video_fb_console_done puts the
++// standard font back, so MiSTer's own Scripts menu looks as it always has.
++static int console_big;
++void video_fb_console()
++{
++	ch_console = 1;
++	fb_write_module_params();
++	video_fb_enable(1);
++	console_big = !con_crt && con_width >= 1600;
++	if (console_big) offload_add_work([] { system("setfont -C /dev/tty2 /usr/share/consolefonts/latarcyrheb-sun32.psfu.gz"); });
++}
++
++void video_fb_console_done()
++{
++	ch_console = 0;
++	if (!console_big) return;
++	console_big = 0;
++	offload_add_work([] { system("setfont -C /dev/tty2 /usr/share/consolefonts/default8x16.psfu.gz"); });
++}
++
+ void video_fb_enable(int enable, int n)
+ {
+ 	PROFILE_FUNCTION();
+@@ -3609,6 +3707,41 @@ void video_fb_enable(int enable, int n)
+ 					yoff = v_cur.item[8] - FB_DV_UBRD;
+ 				}
+ 
++				fe_fb_load();
++				if (!n && !fe_fb.on && fb_game16())
++				{
++					// the frontend over a game, 16-bit (fb_game16)
++					spi_w((uint16_t)(FB_EN | FB_FMT_RxB | FB_FMT_565));
++					spi_w((uint16_t)fb_addr);
++					spi_w(fb_addr >> 16);
++					spi_w(con_width);
++					spi_w(con_height);
++					spi_w(xoff);
++					spi_w(xoff + v_cur.item[1] - 1);
++					spi_w(yoff);
++					spi_w(yoff + v_cur.item[5] - 1);
++					spi_w(fb_game16_stride());
++					fb_write_module_params();
++					input_switch(0);
++					goto fb_enabled_done;
++				}
++				if (!n && fe_fb.on && !ch_console)
++				{
++					// the frontend's own mode (fb_cmd1), kept across Main's restarts
++					spi_w((uint16_t)(FB_EN | fe_fb.sc_fmt));
++					spi_w((uint16_t)fb_addr);
++					spi_w(fb_addr >> 16);
++					spi_w(fe_fb.w);
++					spi_w(fe_fb.h);
++					spi_w(xoff + fe_fb.hmin);
++					spi_w(xoff + fe_fb.hmax);
++					spi_w(yoff + fe_fb.vmin);
++					spi_w(yoff + fe_fb.vmax);
++					spi_w(fe_fb.stride);
++					fb_write_module_params();
++					input_switch(0);
++					goto fb_enabled_done;
++				}
+ 				//printf("Switch to Linux frame buffer\n");
+ 				spi_w((uint16_t)(FB_EN | FB_FMT_RxB | FB_FMT_8888)); // format, enable flag
+ 				spi_w((uint16_t)fb_addr); // base address low word
+@@ -3631,6 +3764,7 @@ void video_fb_enable(int enable, int n)
+ 				{
+ 					input_switch(1);
+ 				}
++			fb_enabled_done:;
+ 			}
+ 			else
+ 			{
+@@ -4290,7 +4424,15 @@ int video_chvt(int num)
+ 		if ((fd = open("/dev/tty0", O_RDONLY | O_CLOEXEC)) >= 0)
+ 		{
+ 			if (ioctl(fd, VT_ACTIVATE, cur_vt)) printf("ioctl VT_ACTIVATE fails\n");
+-			if (ioctl(fd, VT_WAITACTIVE, cur_vt)) printf("ioctl VT_WAITACTIVE fails\n");
++			// corehost: up to 3 s, never forever (a frontend that lets switches go when Linux asks, VT_PROCESS, may be
++			// busy a moment: it can't hold Main; ported from Phosphor's Main)
++			struct vt_stat vs = {};
++			for (int t = 0; t < 300; t++)
++			{
++				if (!ioctl(fd, VT_GETSTATE, &vs) && vs.v_active == cur_vt) break;
++				usleep(10000);
++			}
++			if (vs.v_active != cur_vt) printf("chvt %d: still on tty%d after 3 s\n", cur_vt, vs.v_active);
+ 			close(fd);
+ 		}
+ 	}
+@@ -4396,6 +4538,15 @@ void video_cmd(char *cmd)
+ 			rb = 1;
+ 		}
+ 
++		if (accept && cmd[6] == '1' && fmt == 8888 && width == (int)v_cur.item[1] && height == (int)v_cur.item[5] && fb_game16())
++		{
++			// the frontend's plain full size over a game: 16-bit for games stays (fb_game16)
++			fe_fb.on = 0;
++			unlink(CH_FB_MODE);
++			video_fb_enable(1, 0);
++			return;
++		}
++
+ 		if(accept)
+ 		{
+ 			int stride = ((width * bpp) + 15) & ~15;
+@@ -4423,6 +4574,20 @@ void video_cmd(char *cmd)
+ 			spi_w(stride);         // stride
+ 			DisableIO();
+ 
++			if (cmd[6] == '1')
++			{
++				// kept for Main's next start (fe_fb); the full 32-bit size is no mode of its own
++				fe_fb.on = !(fmt == 8888 && width == (int)v_cur.item[1] && height == (int)v_cur.item[5]);
++				if (fe_fb.on)
++				{
++					fe_fb.fmt = fmt; fe_fb.rb = rb; fe_fb.w = width; fe_fb.h = height; fe_fb.stride = stride; fe_fb.sc_fmt = sc_fmt;
++					fe_fb.hmin = hmin; fe_fb.hmax = hmax; fe_fb.vmin = vmin; fe_fb.vmax = vmax;
++					mkdir("/tmp/corehost", 0755);
++					FILE *f = fopen(CH_FB_MODE, "w");
++					if (f) { fprintf(f, "%d %d %d %d %d %d %d %d %d %d\n", fmt, rb, width, height, stride, sc_fmt, hmin, hmax, vmin, vmax); fclose(f); }
++				}
++				else unlink(CH_FB_MODE);
++			}
+ 			if (cmd[6] != '2')
+ 			{
+ 				static char cmd[256];
+diff --git a/video.h b/video.h
+index 987dfbc..9f38cb3 100644
+--- a/video.h
++++ b/video.h
+@@ -66,6 +66,8 @@ void  video_mode_adjust(bool force = false);
+ 
+ int   hasAPI1_5();
+ 
++void video_fb_console();     // corehost: MiSTer's terminal framebuffer mode for a script (big font at 1080p)
++void video_fb_console_done(); // corehost: the script finished: the terminal's usual font
+ void video_fb_enable(int enable, int n = 0);
+ int video_fb_state();
+ void video_menu_bg(int n, int idle = 0);
+@@ -80,4 +82,6 @@ char* video_get_core_mode_name(int with_vrefresh = 1);
+ 
+ void dbg_draw_cursor(int x, int y);
+ 
++void video_fb_handoff(void);   // another Main takes over: the framebuffer as stock leaves it
++
+ #endif // VIDEO_H

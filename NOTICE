@@ -1,0 +1,31 @@
+corehost (codename Fushi Tensei)
+Copyright (C) 2026 f3bandit (https://github.com/f3bandit)
+
+corehost is a fork of Main_MiSTer (https://github.com/MiSTer-devel/Main_MiSTer), by Alexey Melnikov "Sorgelig" and
+the MiSTer devs, with the authors its files name (Minimig: Dennis van Weeren, Jakub Bednarski, Till Harbaum; and every
+contributor in Main_MiSTer's history). It is licensed, as Main_MiSTer is, under the GNU General Public License,
+version 3 or (at your option) any later version: LICENSE.
+
+What the GPL covers here
+  corehost.patch (the changes to Main_MiSTer, corehost.cpp and corehost.h among them), build.sh and every corehost
+  binary built from them. Anyone given a corehost binary is entitled to its source under the GPL: this repository,
+  at the commit the binary was built from (UPSTREAM names the Main_MiSTer commit; the Super MemCard / Coreshell shim
+  it is built with is in https://github.com/f3bandit/super-memcard, also GPL-3.0).
+
+What it doesn't cover
+  corehost is a separate program. Programs that only talk to it over its local socket (/tmp/corehost.sock, one text
+  command per line) or start it, and include none of its code, are not covered by its licence and keep their own:
+    Coreshell (codename Kugutsu no Jutsu, https://github.com/f3bandit/core_shell)   Apache-2.0
+    the other parts of Infinite Tsukuyomi besides corehost                      their own licences
+    frontends: Phosphor, Console Mode, any other                            their own licences
+  The socket protocol (the commands and events in README.md) is an interface: anyone may implement either end of it.
+
+  tools/ (ch.py, test_frontend.py) are standalone clients of that socket, by f3bandit, under the Apache License 2.0
+  (http://www.apache.org/licenses/LICENSE-2.0), so they can be reused in frontends of any licence. So are
+  tools/kernel_watch.py and tools/main_watch.py and the workflows in .github/ (they only read other repositories).
+
+Ported in
+  The frontend API is ported from Phosphor's Main (phosphor-main/phosphor.cpp, f3bandit, GPL-3.0), itself a fork of
+  Main_MiSTer.
+
+corehost is not affiliated with or endorsed by the MiSTer project or any author credited above.

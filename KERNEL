@@ -1,0 +1,4 @@
+# The MiSTer kernel corehost and Coreshell were last checked against (tools/kernel_watch.py, .github/workflows/kernel-watch.yml).
+# Move it forward once a change is checked: on the SS1 when a MiSTer Linux carries it, or by reading the diff.
+branch MiSTer-v6.18
+commit 9fcb1cb21313ec1b5b601d3945ffa6f604ccaf49
