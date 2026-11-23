@@ -20,7 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: The tag
-        run: echo "$TAG" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || { echo "tag: vYYYY.MM.DD[.n]"; exit 1; }
+        run: |
+          echo "$TAG" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || { echo "the tag is vYYYY.MM.DD[.n]"; exit 1; }
       - name: The shim (super-memcard, public)
         uses: actions/checkout@v4
         with:
